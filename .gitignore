@@ -1,0 +1,7 @@
+node_modules/
+out/
+*.vsix
+
+# Internal notes, not for the public repo
+docs/
+.vakt/

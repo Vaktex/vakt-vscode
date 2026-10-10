@@ -1,0 +1,325 @@
+{
+  "name": "vakt-vscode",
+  "displayName": "VAKT: local security review (DOM-0.8B)",
+  "description": "Function-level security risk scores from DOM-0.8B, inline in the editor. Runs on your machine; your code never leaves it.",
+  "version": "0.1.0",
+  "publisher": "vaktex",
+  "license": "Apache-2.0",
+  "homepage": "https://vaktex.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Vaktex/vakt-vscode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Vaktex/vakt-vscode/issues"
+  },
+  "galleryBanner": {
+    "color": "#141413",
+    "theme": "dark"
+  },
+  "pricing": "Free",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "security",
+    "sast",
+    "vulnerability",
+    "cwe",
+    "local"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In untrusted workspaces vakt always scans with --no-repo-ignores, so the repository's own .gitignore/.vaktignore cannot hide files from the scan."
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "vakt.scanFile",
+        "title": "Scan Current File",
+        "category": "VAKT",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "vakt.scanWorkspace",
+        "title": "Scan Workspace",
+        "category": "VAKT",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "vakt.cancel",
+        "title": "Cancel Scans",
+        "category": "VAKT",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "vakt.clear",
+        "title": "Clear Findings",
+        "category": "VAKT",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "vakt.setup",
+        "title": "Set Up Model (sign in and download DOM-0.8B)",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.install",
+        "title": "Install VAKT CLI (in Terminal)",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.doctor",
+        "title": "Run Doctor",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.showOutput",
+        "title": "Show Log",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.showFindingAtCursor",
+        "title": "Show Finding at Cursor",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.ignoreFinding",
+        "title": "Ignore Finding",
+        "category": "VAKT",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "vakt.clearIgnores",
+        "title": "Restore Ignored Findings",
+        "category": "VAKT",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "vakt.showFinding",
+        "title": "Show Finding",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.revealFinding",
+        "title": "Reveal Finding",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.reviewWithAgent",
+        "title": "Review and Fix with Agent",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.copyReviewPrompt",
+        "title": "Copy Review Prompt",
+        "category": "VAKT"
+      }
+    ],
+    "icons": {
+      "vakt-logo": {
+        "description": "VAKT logo",
+        "default": {
+          "fontPath": "media/vakt-icons.woff",
+          "fontCharacter": "\\E000"
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "vakt.showFindingAtCursor",
+        "key": "ctrl+alt+v",
+        "mac": "cmd+alt+v",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "vakt.scanWorkspace",
+          "when": "view == vakt.findings && !vakt.busy",
+          "group": "navigation@1"
+        },
+        {
+          "command": "vakt.cancel",
+          "when": "view == vakt.findings && vakt.busy",
+          "group": "navigation@1"
+        },
+        {
+          "command": "vakt.clear",
+          "when": "view == vakt.findings",
+          "group": "navigation@2"
+        },
+        {
+          "command": "vakt.clearIgnores",
+          "when": "view == vakt.findings",
+          "group": "more@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "vakt.scanFile",
+          "when": "resourceScheme == file",
+          "group": "vakt@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "vakt.scanFile",
+          "when": "resourceScheme == file"
+        },
+        {
+          "command": "vakt.ignoreFinding",
+          "when": "false"
+        },
+        {
+          "command": "vakt.showFinding",
+          "when": "false"
+        },
+        {
+          "command": "vakt.revealFinding",
+          "when": "false"
+        },
+        {
+          "command": "vakt.copyReviewPrompt",
+          "when": "false"
+        },
+        {
+          "command": "vakt.reviewWithAgent",
+          "when": "false"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vakt",
+          "title": "VAKT",
+          "icon": "media/vakt.svg"
+        }
+      ]
+    },
+    "views": {
+      "vakt": [
+        {
+          "type": "webview",
+          "id": "vakt.findings",
+          "name": "Findings"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "VAKT",
+      "properties": {
+        "vakt.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Path to the `vakt` binary. Empty: `~/.local/bin/vakt`, then `PATH`. Machine-scoped so a workspace cannot point it at another executable."
+        },
+        "vakt.scanOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Scan a file when it is saved (languages vakt has a grammar for)."
+        },
+        "vakt.scanOnType": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Score the file you are editing about 1.5 s after you stop typing, unsaved changes included. Uses one long-running `vakt serve` that keeps the model loaded (stopped after 10 idle minutes); only functions that changed are re-scored."
+        },
+        "vakt.scanWorkspaceOnOpen": {
+          "type": "boolean",
+          "default": false,
+          "description": "Scan each workspace folder when it is opened. Re-scans are fast because vakt caches scores per function."
+        },
+        "vakt.threshold": {
+          "type": "number",
+          "default": 0.95,
+          "minimum": 0.01,
+          "maximum": 1,
+          "markdownDescription": "Flag functions with severity at or above this score (`--threshold`)."
+        },
+        "vakt.minConfidence": {
+          "type": "number",
+          "default": 0.9,
+          "minimum": 0,
+          "maximum": 1,
+          "markdownDescription": "Minimum selected-family score for a finding (`--min-confidence`). 0 disables the gate. Not a calibrated vulnerability probability."
+        },
+        "vakt.diagnosticSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "default": "warning",
+          "description": "How findings appear in the Problems panel."
+        },
+        "vakt.precision": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "fp32",
+            "tf32",
+            "bf16",
+            "fp16"
+          ],
+          "default": "auto",
+          "markdownDescription": "Compute precision (`--precision`)."
+        },
+        "vakt.device": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "gpu",
+            "cpu"
+          ],
+          "default": "auto",
+          "markdownDescription": "Device (`--device`)."
+        },
+        "vakt.topLevel": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Also score code outside functions (`--top-level`). These fragments score less reliably."
+        },
+        "vakt.noRepoIgnores": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Ignore the repository's `.gitignore`/`.vaktignore` (`--no-repo-ignores`). Always on in untrusted workspaces."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "npm run compile && node --test \"out/test/*.test.js\"",
+    "package": "npm run compile && vsce package",
+    "publish:vscode": "npm run package && vsce publish --packagePath vakt-vscode-$npm_package_version.vsix",
+    "publish:openvsx": "npm run package && npx --yes ovsx publish vakt-vscode-$npm_package_version.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/vscode": "1.100.0",
+    "@vscode/vsce": "4.0.0",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "highlight.js": "11.11.1"
+  },
+  "icon": "media/icon.png"
+}

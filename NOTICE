@@ -1,0 +1,15 @@
+VAKT for VS Code
+Copyright 2026 Vaktex
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This extension includes third-party components under their own licences:
+
+- Vaktex Sans (media/fonts), a modified version of Inter, Noto Sans Hebrew
+  and Noto Sans Arabic. SIL Open Font License 1.1: media/fonts/Vaktex-Sans-OFL.txt.
+- highlight.js (node_modules/highlight.js), syntax highlighting.
+  BSD 3-Clause License: node_modules/highlight.js/LICENSE.
+- Lucide icons (https://lucide.dev), icon outlines copied into the source.
+  ISC License, Copyright (c) for portions of Lucide are held by Cole Bemis
+  2013-2022 as part of Feather (MIT); all other copyright (c) for Lucide are
+  held by Lucide Contributors 2022.
