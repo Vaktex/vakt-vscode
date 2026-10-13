@@ -1,7 +1,7 @@
 {
   "name": "vakt-vscode",
   "displayName": "VAKT: local security review (DOM-0.8B)",
-  "description": "Function-level security risk scores from DOM-0.8B, inline in the editor. Runs on your machine; your code never leaves it.",
+  "description": "Function-level security risk scores from DOM-0.8B, inline in the editor. Scoring runs on your machine. Anonymized cloud review, on by default, sends functions and a code graph to Vaktex for a second opinion and to train Vaktex models; Fully local sends nothing.",
   "version": "0.1.0",
   "publisher": "vaktex",
   "license": "Apache-2.0",
@@ -35,7 +35,8 @@
   ],
   "main": "./out/src/extension.js",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onUri"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -57,6 +58,11 @@
         "title": "Scan Workspace",
         "category": "VAKT",
         "icon": "$(shield)"
+      },
+      {
+        "command": "vakt.uploadGraph",
+        "title": "Upload Anonymized Scanned Code Graph",
+        "category": "VAKT"
       },
       {
         "command": "vakt.cancel",
@@ -125,6 +131,21 @@
       {
         "command": "vakt.copyReviewPrompt",
         "title": "Copy Review Prompt",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.signIn",
+        "title": "Sign In to Vaktex",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.signOut",
+        "title": "Sign Out of Vaktex",
+        "category": "VAKT"
+      },
+      {
+        "command": "vakt.fixWithCloud",
+        "title": "Fix with Cloud",
         "category": "VAKT"
       }
     ],
@@ -199,6 +220,10 @@
         {
           "command": "vakt.reviewWithAgent",
           "when": "false"
+        },
+        {
+          "command": "vakt.fixWithCloud",
+          "when": "false"
         }
       ]
     },
@@ -228,6 +253,20 @@
           "default": "",
           "scope": "machine",
           "markdownDescription": "Path to the `vakt` binary. Empty: `~/.local/bin/vakt`, then `PATH`. Machine-scoped so a workspace cannot point it at another executable."
+        },
+        "vakt.improvedResponses": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "order": 0,
+          "markdownDescription": "Cloud review (anonymized). Sends functions and a code graph, with comments, names and paths specific to your project removed on your machine, to Vaktex for a second opinion, and uses them to train Vaktex models (kept up to 24 months, no user identifier). Turn on Fully local to send nothing."
+        },
+        "vakt.fullyLocal": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "order": 1,
+          "markdownDescription": "Fully local: send nothing and never contact the cloud. Turns off cloud review, the code graph, cloud fixes and training; scores come from DOM-0.8B on this machine only."
         },
         "vakt.scanOnSave": {
           "type": "boolean",
@@ -315,11 +354,13 @@
   "devDependencies": {
     "@types/node": "22.20.5",
     "@types/vscode": "1.100.0",
-    "@vscode/vsce": "4.0.0",
-    "typescript": "5.9.3"
+    "@vscode/vsce": "4.0.0"
   },
   "dependencies": {
-    "highlight.js": "11.11.1"
+    "highlight.js": "11.11.1",
+    "tree-sitter-wasms": "0.1.13",
+    "typescript": "5.9.3",
+    "web-tree-sitter": "0.25.10"
   },
   "icon": "media/icon.png"
 }

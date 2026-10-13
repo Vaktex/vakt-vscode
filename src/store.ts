@@ -16,6 +16,11 @@ export class ResultStore {
   private readonly models = new Map<string, Report["model"]>();
   /** Optional filter (ignored findings), applied to findings() and fileFindings(). */
   hide: (root: string, u: Unit) => boolean = () => false;
+  /**
+   * What to show for a unit: itself, a relabelled copy, or nothing. Cloud
+   * review (src/cloud.ts) replaces it; by default the local gates decide.
+   */
+  view: (root: string, u: Unit, g: Gates) => Unit | undefined = (_root, u, g) => (isFinding(u, g) ? u : undefined);
 
   model(root: string): Report["model"] | undefined {
     return this.models.get(root);
@@ -108,7 +113,32 @@ export class ResultStore {
 
   /** Findings in one file, in line order. */
   fileFindings(root: string, file: string, g: Gates): Unit[] {
-    return this.units(root, file).filter((u) => isFinding(u, g) && !this.hide(root, u));
+    const out: Unit[] = [];
+    for (const u of this.units(root, file)) {
+      const v = this.hide(root, u) ? undefined : this.view(root, u, g);
+      if (v) out.push(v);
+    }
+    return out;
+  }
+
+  /** Every scored unit not ignored, flagged or not (cloud review's important-function sweep). */
+  all(): Finding[] {
+    const out: Finding[] = [];
+    for (const [root, files] of this.byRoot) {
+      for (const units of files.values()) for (const unit of units) if (!this.hide(root, unit)) out.push({ root, unit });
+    }
+    return out;
+  }
+
+  /** DOM-0.8B's own findings, before cloud review: what it should review. */
+  candidates(g: Gates): Finding[] {
+    const out: Finding[] = [];
+    for (const [root, files] of this.byRoot) {
+      for (const units of files.values()) {
+        for (const unit of units) if (isFinding(unit, g) && !this.hide(root, unit)) out.push({ root, unit });
+      }
+    }
+    return out;
   }
 
   /** Scored units, flagged files and total files, for the sidebar summary. */
@@ -130,9 +160,7 @@ export class ResultStore {
   findings(g: Gates): Finding[] {
     const out: Finding[] = [];
     for (const [root, files] of this.byRoot) {
-      for (const units of files.values()) {
-        for (const unit of units) if (isFinding(unit, g) && !this.hide(root, unit)) out.push({ root, unit });
-      }
+      for (const file of files.keys()) for (const unit of this.fileFindings(root, file, g)) out.push({ root, unit });
     }
     return out.sort(
       (a, b) =>

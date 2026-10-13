@@ -5,13 +5,16 @@
 // findings grouped by file and by family. Grouping, the severity chips, the
 // filter box and collapsed groups are handled in the page and remembered with
 // the webview's own state, so they survive re-renders. Repo-derived text is
-// HTML-escaped and the CSP allows only our nonce'd script.
+// HTML-escaped and the CSP allows only our nonce'd script. Every page ends
+// with the same footer slot: ignored findings and the Vaktex account line.
 
+import { accountLine, AccountView } from "./account";
 import { esc } from "./detailHtml";
 import { issueFor, severityLabel } from "./families";
 import { unitName } from "./present";
 import { Unit } from "./report";
 import { fontFace, THEME_CSS } from "./theme";
+import { happyVexie, VEXIE_CSS } from "./vexie";
 
 export interface ListItem {
   key: string;
@@ -34,7 +37,10 @@ export interface ListModel {
   scanning?: string;
   stats: { units: number; files: number };
   ignored: number;
-  setup: { binary: boolean; model: boolean };
+  /** signedIn is undefined when nothing would use the account (fully local, or cloud review off): no step for it. */
+  setup: { binary: boolean; model: boolean; signedIn?: boolean };
+  /** The account line in the footer; undefined hides it. */
+  account?: AccountView;
 }
 
 const LEVELS = [
@@ -114,6 +120,17 @@ function setupSteps(m: ListModel): string {
         `<span class="note">Needs Hugging Face access to <code>vaktex/dom-oss-0.8b</code></span>` +
         `<button type="button" class="pill" data-cmd="setup">Set up model</button>`,
     },
+    ...(m.setup.signedIn === undefined
+      ? []
+      : [
+          {
+            text: "Create a free account",
+            done: m.setup.signedIn,
+            extra:
+              `<span class="note">$30 in value.</span>` +
+              `<button type="button" class="pill" data-cmd="signIn">Create account</button>`,
+          },
+        ]),
     { text: "Scan your workspace", done: false, extra: "" },
   ];
   const current = steps.findIndex((s) => !s.done);
@@ -133,6 +150,24 @@ function setupSteps(m: ListModel): string {
       .join("")}
   </ol>
   <button type="button" class="wide${ready ? " primary" : ""}" data-cmd="scan">Scan workspace</button>
+  ${footer(m, { ignored: false, signIn: m.setup.signedIn === undefined })}
+</main>`;
+}
+
+/** A finished scan with nothing to show. */
+function noFindings(m: ListModel): string {
+  return `
+<main class="empty clear">
+  <section class="clear-head" aria-live="polite">
+    ${happyVexie(76)}
+    <h1>No findings</h1>
+    <p class="lead">Nothing in ${plural(m.stats.units, "function")} across ${plural(m.stats.files, "file")} is at or above your thresholds.</p>
+  </section>
+  <div class="clear-actions">
+    <button type="button" class="wide primary" data-cmd="scan">${icon("scan", 15)}Scan again</button>
+    <button type="button" class="wide" data-cmd="settings">Adjust settings</button>
+  </div>
+  ${footer(m, { ignored: false, signIn: true })}
 </main>`;
 }
 
@@ -178,7 +213,7 @@ function findingsList(m: ListModel): string {
   const head = m.scanning
     ? `<section class="summary" aria-live="polite">
         <div class="summary-row">
-          <div class="summary-text">
+          <div class="summary-text" data-slot="summary">
             <h1>Scanning ${esc(m.scanning)}</h1>
             <span class="sub"><span data-count>${count}</span> so far</span>
           </div>
@@ -188,7 +223,7 @@ function findingsList(m: ListModel): string {
       </section>`
     : `<section class="summary">
         <div class="summary-row">
-          <div class="summary-text">
+          <div class="summary-text" data-slot="summary">
             <h1 data-count>${count}</h1>
             <span class="sub">${plural(m.stats.units, "function")} found in ${plural(m.stats.files, "file")}</span>
           </div>
@@ -203,27 +238,63 @@ function findingsList(m: ListModel): string {
 <main class="list">
   ${head}
   <label class="search">${icon("search", 14)}<input type="search" data-filter aria-label="Filter findings" placeholder="Filter by file, function or family"></label>
-  <div class="chips" role="group" aria-label="Severity">${chips}</div>
+  <div class="chips" role="group" aria-label="Severity" data-slot="chips">${chips}</div>
   <div class="tabs" role="tablist" aria-label="Group findings">
     <button type="button" role="tab" data-tab="file" aria-selected="true">By file</button>
     <button type="button" role="tab" data-tab="family" aria-selected="false">By family</button>
   </div>
-  <div class="tree" data-view="file">${byFile.join("")}</div>
-  <div class="tree" data-view="family" hidden>${byFamily.join("")}</div>
-  <p class="none" hidden>${m.items.length ? "No findings match." : m.scanning ? "No findings yet." : "No findings at the current thresholds."}</p>
-  ${
-    m.ignored
-      ? `<footer>
-          <span class="ignored">${icon("eyeOff", 13)}${m.ignored.toLocaleString("en-US")} ignored</span>
-          <a href="#" data-cmd="restore">Restore</a>
-        </footer>`
-      : ""
-  }
+  <div class="tree" data-view="file" data-slot="file">${byFile.join("")}</div>
+  <div class="tree" data-view="family" data-slot="family" hidden>${byFamily.join("")}</div>
+  <p class="none" data-slot="none" hidden>${m.items.length ? "No findings match." : m.scanning ? "No findings yet." : "No findings at the current thresholds."}</p>
+  ${footer(m, { ignored: true, signIn: true })}
 </main>`;
 }
 
+/**
+ * The footer slot: ignored findings (list page only) and the account line.
+ * `signIn: false` drops the signed-out line where the checklist already asks.
+ */
+function footer(m: ListModel, o: { ignored: boolean; signIn: boolean }): string {
+  const rows: string[] = [];
+  if (o.ignored && m.ignored) {
+    rows.push(`<div class="foot-row">
+      <span class="ignored">${icon("eyeOff", 13)}${m.ignored.toLocaleString("en-US")} ignored</span>
+      <a href="#" data-cmd="restore">Restore</a>
+    </div>`);
+  }
+  if (m.account && (m.account.signedIn || o.signIn)) {
+    const a = accountLine(m.account);
+    rows.push(`<div class="foot-row account">
+      <span class="account-text"><span class="account-status">${esc(a.status)}</span>${a.usage ? `<span>${esc(a.usage)}</span>` : ""}</span>
+      <a href="#" data-cmd="${a.link.cmd}">${a.link.label}</a>
+    </div>`);
+  }
+  return `<div class="slot" data-slot="footer">${rows.length ? `<footer>${rows.join("")}</footer>` : ""}</div>`;
+}
+
+/** The page's body. Sent alone (listBody) to update a loaded page in place. */
+export function listBody(m: ListModel): string {
+  if (isClear(m)) return noFindings(m);
+  return m.hasResults || m.scanning ? findingsList(m) : setupSteps(m);
+}
+
+/** A finished scan that left nothing to list. */
+const isClear = (m: ListModel) => m.hasResults && !m.scanning && m.items.length === 0;
+
+/**
+ * Pages of the same shape differ only inside their data-slot elements, so one
+ * can be patched into the other; a different shape needs a new page.
+ */
+export function listShape(m: ListModel): string {
+  // Only the footer is a slot: any other change to what it says is a new page (rare: it is static).
+  if (isClear(m)) return `clear:${m.stats.units}:${m.stats.files}`;
+  if (m.hasResults || m.scanning) return m.scanning ? "scanning" : "list";
+  // The checklist's only slot is the footer: each state of the steps is its own page.
+  return `setup:${m.setup.binary}:${m.setup.model}:${m.setup.signedIn}`;
+}
+
 export function listHtml(m: ListModel, opts: { nonce: string; cspSource: string; fontUri?: string }): string {
-  const body = m.hasResults || m.scanning ? findingsList(m) : setupSteps(m);
+  const body = listBody(m);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -231,7 +302,7 @@ export function listHtml(m: ListModel, opts: { nonce: string; cspSource: string;
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; font-src ${opts.cspSource}; style-src ${opts.cspSource} 'nonce-${opts.nonce}'; script-src 'nonce-${opts.nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VAKT findings</title>
-<style nonce="${opts.nonce}">${opts.fontUri ? fontFace(opts.fontUri) : ""}${THEME_CSS}${CSS}</style>
+<style nonce="${opts.nonce}">${opts.fontUri ? fontFace(opts.fontUri) : ""}${THEME_CSS}${CSS}${VEXIE_CSS}</style>
 </head>
 <body>
 ${body}
@@ -241,7 +312,10 @@ ${body}
 }
 
 // Runs in the webview. View state (grouping, severity filter, text filter,
-// collapsed groups) lives in vscode.getState so it survives re-renders.
+// collapsed groups) lives in vscode.getState so it survives a new page.
+// Updates arrive as messages and replace only the data-slot elements, so the
+// scanning bar, the filter box (and its focus) and scroll positions are left
+// alone: replacing the whole page many times a second made it flicker.
 const SCRIPT = `
 const vscode = typeof acquireVsCodeApi === "function" ? acquireVsCodeApi() : { postMessage: (m) => console.log(m), getState: () => undefined, setState: () => {} };
 const state = Object.assign({ view: "file", off: [], closed: [], q: "", scroll: {} }, vscode.getState() || {});
@@ -297,8 +371,18 @@ document.addEventListener("click", (e) => {
   apply();
 });
 if (filter) filter.addEventListener("input", () => { state.q = filter.value; apply(); });
+window.addEventListener("message", (e) => {
+  if (!e.data || e.data.type !== "update" || typeof e.data.body !== "string") return;
+  const next = new DOMParser().parseFromString(e.data.body, "text/html");
+  for (const slot of $$("[data-slot]")) {
+    const fresh = $('[data-slot="' + slot.dataset.slot + '"]', next);
+    if (fresh) slot.innerHTML = fresh.innerHTML;
+  }
+  apply();
+});
 apply();
-// Each update re-renders the page: put each list back where it was scrolled to.
+vscode.postMessage({ cmd: "ready" });
+// A new page (the view was hidden, or its shape changed): put each list back where it was scrolled to.
 for (const tree of $$(".tree")) {
   tree.scrollTop = state.scroll[tree.dataset.view] || 0;
   tree.addEventListener("scroll", () => { state.scroll[tree.dataset.view] = tree.scrollTop; vscode.setState(state); }, { passive: true });
@@ -315,6 +399,8 @@ body {
 html, body { height: 100%; }
 body { overflow: hidden; }
 main { display: flex; flex-direction: column; gap: 14px; height: 100%; min-height: 0; }
+/* A wrapper only there to be patched: no box, so no gap when empty. */
+.slot { display: contents; }
 /* Only the findings scroll; the summary, filters and footer stay put. */
 main.list > * { flex: none; }
 main.list > .tree { flex: 1 1 auto; min-height: 0; overflow-y: auto; margin: 0 -12px; padding: 0 12px 4px; }
@@ -383,8 +469,12 @@ code { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0; }
 .new { flex: none; padding: 0 6px; border-radius: 999px; background: var(--new-bg); color: var(--new); font-size: 10.5px; font-weight: 700; letter-spacing: 0.02em; }
 .none { margin: 8px 4px; color: var(--muted); }
 
-footer { flex: none; margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 4px 0; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+footer { flex: none; margin-top: auto; display: flex; flex-direction: column; gap: 10px; padding: 12px 4px 0; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.foot-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.foot-row a { flex: none; }
 .ignored { display: flex; align-items: center; gap: 6px; }
+.account-text { display: flex; flex-direction: column; min-width: 0; text-wrap: pretty; }
+.account-status { color: var(--ink); font-weight: 600; }
 
 .empty { gap: 22px; }
 .empty h1 { padding: 0 4px; font-size: 18px; letter-spacing: -0.015em; }
@@ -406,4 +496,16 @@ footer { flex: none; margin-top: auto; display: flex; align-items: center; justi
 .wide { height: 44px; border: 0; border-radius: 999px; font-size: 14px; font-weight: 600; background: var(--panel2); color: var(--muted); }
 .wide.primary { background: var(--primary); color: var(--on-primary); }
 .wide:hover { opacity: 0.88; }
+
+/* No findings: centred in the panel, VEXIE, a short lead and two actions. */
+main.clear { justify-content: center; gap: 20px; padding: 0 4px; }
+/* With a footer, centre the rest in the space above it. */
+main.clear > .clear-head { margin-top: auto; }
+main.clear > .clear-actions { margin-bottom: auto; }
+main.clear footer { margin: 0 -4px; }
+.clear-head { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; }
+.clear-head h1 { padding: 0; font-size: 18px; letter-spacing: -0.015em; }
+.lead { margin: 0; max-width: 26em; font-size: 13px; line-height: 1.45; color: var(--muted); text-wrap: pretty; }
+.clear-actions { display: flex; flex-direction: column; gap: 8px; }
+.clear-actions .wide { display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
 `;

@@ -19,6 +19,13 @@ export function fileKey(root: string, file: string): string {
   return JSON.stringify([root, file]);
 }
 
+/** One finding ignored (`unit`), or a whole file (no `unit`). */
+export interface IgnoreEvent {
+  root: string;
+  file: string;
+  unit?: Unit;
+}
+
 export class Ignores {
   private units: Set<string>;
   private files: Set<string>;
@@ -37,6 +44,17 @@ export class Ignores {
     return { dispose: () => this.listeners.delete(fn) };
   }
 
+  private readonly willIgnore = new Set<(e: IgnoreEvent) => void>();
+
+  /**
+   * Fires when the user ignores something new, before it is hidden, so what
+   * was on screen can still be read (cloud feedback, CloudReview.reportFeedback).
+   */
+  onWillIgnore(fn: (e: IgnoreEvent) => void): { dispose(): void } {
+    this.willIgnore.add(fn);
+    return { dispose: () => this.willIgnore.delete(fn) };
+  }
+
   private commit(): void {
     this.save({ units: [...this.units], files: [...this.files] });
     for (const fn of this.listeners) fn();
@@ -47,12 +65,16 @@ export class Ignores {
   }
 
   ignoreUnit(root: string, u: Unit): void {
-    this.units.add(unitKey(root, u));
+    const key = unitKey(root, u);
+    if (!this.units.has(key)) for (const fn of this.willIgnore) fn({ root, file: u.file, unit: u });
+    this.units.add(key);
     this.commit();
   }
 
   ignoreFile(root: string, file: string): void {
-    this.files.add(fileKey(root, file));
+    const key = fileKey(root, file);
+    if (!this.files.has(key)) for (const fn of this.willIgnore) fn({ root, file });
+    this.files.add(key);
     this.commit();
   }
 

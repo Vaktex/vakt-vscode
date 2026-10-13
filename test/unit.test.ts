@@ -12,7 +12,7 @@ import { ResultStore } from "../src/store";
 import { Ignores, IgnoreState } from "../src/ignores";
 import { detailHtml } from "../src/detailHtml";
 import { highlightLines } from "../src/highlight";
-import { findingKey, listHtml, listItems } from "../src/listHtml";
+import { findingKey, listBody, listHtml, listItems, listShape } from "../src/listHtml";
 
 const S: ScanSettings = { threshold: 0.95, minConfidence: 0.9, precision: "auto", device: "auto", topLevel: false, noRepoIgnores: false };
 
@@ -405,4 +405,29 @@ test("Resolve picks the editor's agent, else the clipboard", () => {
   assert.match(p, /fix it in place/);
   assert.match(p, /change nothing/);
   assert.match(p, /File: app\.py, lines 4-8/);
+});
+
+test("listHtml: updates of the same shape only touch the slots", () => {
+  const model = (scanning: string | undefined, n: number) => ({
+    items: listItems(Array.from({ length: n }, (_, i) => ({ root: "/r", unit: unit({ start_line: i + 1 }) })), {}),
+    hasResults: true, scanning, stats: { units: n, files: 1 }, ignored: 0, setup: { binary: true, model: true },
+  });
+  assert.equal(listShape(model("codebase", 1)), listShape(model("app.py", 5)), "scanning more is a patch");
+  assert.notEqual(listShape(model("codebase", 1)), listShape(model(undefined, 1)), "scan finished: new page");
+  assert.notEqual(listShape({ ...model(undefined, 0), hasResults: false }), listShape({ ...model(undefined, 0), hasResults: false, setup: { binary: false, model: false } }));
+  const body = listBody(model("codebase", 2));
+  for (const slot of ["summary", "chips", "file", "family", "none", "footer"]) assert.match(body, new RegExp(`data-slot="${slot}"`));
+});
+
+test("listHtml: a clean scan gets its own page, with happy VEXIE", () => {
+  const base = { items: [], hasResults: true, stats: { units: 4307, files: 1088 }, ignored: 0, setup: { binary: true, model: true } };
+  const page = listBody(base);
+  assert.match(page, /No findings/);
+  assert.match(page, /aria-label="VEXIE, smiling"/);
+  assert.match(page, /4,307 functions across 1,088 files/);
+  assert.match(page, /data-cmd="scan"/);
+  assert.doesNotMatch(page, /data-filter|data-chip/, "nothing to filter");
+  // Still scanning: the list, not this page.
+  assert.match(listBody({ ...base, scanning: "codebase" }), /data-filter/);
+  assert.match(listShape(base), /^clear:/);
 });

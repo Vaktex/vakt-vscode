@@ -9,7 +9,7 @@ npm run package                           # vakt-vscode-0.1.0.vsix
 
 Press F5 in this folder to start an Extension Development Host.
 
-Only `extension.ts`, `ui.ts`, `panel.ts` and `listView.ts` import `vscode`. Everything else (`cli`, `report`, `store`, `scheduler`, `present`, `families`, `detailHtml`, `listHtml`, `highlight`, `theme`) is plain Node and covered by `node --test`.
+Only `extension.ts`, `ui.ts`, `panel.ts`, `listView.ts` and `auth.ts` import `vscode`. Everything else (`cli`, `report`, `store`, `scheduler`, `present`, `families`, `detailHtml`, `listHtml`, `highlight`, `theme`, `authFlow`) is plain Node and covered by `node --test`.
 
 `src/families.ts` mirrors `internal/labels` at the pinned weights. When `brand.ModelCommit` moves, update it at the same time.
 

@@ -36,6 +36,13 @@ export function levelLetter(score: number): string {
   return severityLabel(score)[0];
 }
 
+/** What cloud review did to a finding, as a tag. */
+const CLOUD_TAG: Record<NonNullable<Unit["cloud"]>["operation"], string> = {
+  confirm: "Cloud verified",
+  reclassify: "Relabelled by cloud",
+  add: "Found by cloud",
+};
+
 /** Families shown as bars; the rest above 0.01 go in the "more" disclosure. */
 const SHOWN_FAMILIES = 2;
 
@@ -130,6 +137,7 @@ export function detailHtml(m: DetailModel, opts: { nonce: string; cspSource: str
     <span class="tag sev ${LEVEL_CLASS[level]}" title="Severity ${fmt(u.severity)}">${level[0] + level.slice(1).toLowerCase()}</span>
     ${issue.cwe && url ? `<a class="tag cwe" href="${url}">${esc(issue.cwe)}</a>` : ""}
     <span class="tag">${esc(sanitize(u.language, 40))}</span>
+    ${u.cloud ? `<span class="tag" title="Cloud review">${CLOUD_TAG[u.cloud.operation]}</span>` : ""}
     ${m.ignored ? `<span class="tag">Ignored</span>` : ""}
   </div>
   <p class="desc">${esc(issue.description)}</p>
@@ -153,7 +161,7 @@ export function detailHtml(m: DetailModel, opts: { nonce: string; cspSource: str
 </section>
 
 <div class="actions">
-  <button class="primary" data-cmd="review" title="Ask your coding agent to review this finding and fix it">Resolve</button>
+  <button class="primary" data-cmd="review" title="Ask your coding agent to review this finding and fix it, or VAKT Cloud if this editor has no agent">Resolve</button>
   <div class="pair">
     <button data-cmd="rescan" title="Scan ${esc(u.file)} again">Rescan</button>
     <button data-cmd="ignoreUnit" title="Hide this finding in this workspace" ${m.ignored ? "disabled" : ""}>${m.ignored ? "Ignored" : "Ignore"}</button>

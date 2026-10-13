@@ -37,6 +37,9 @@ export interface Unit {
   truncated?: boolean;
   split_of?: number;
   parts?: Part[];
+  /** Set by the extension (never by vakt) when cloud review confirmed, relabelled or added this finding. */
+  /** `engine`: the opaque cloud engine version; never shown, and never a model name. */
+  cloud?: { operation: "confirm" | "reclassify" | "add"; engine: string };
 }
 
 export interface Skip {

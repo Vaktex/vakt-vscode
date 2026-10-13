@@ -67,6 +67,8 @@ body.vscode-high-contrast, body.vscode-high-contrast-light {
 body.vscode-high-contrast .tag, body.vscode-high-contrast-light .tag, body.vscode-high-contrast .bar, body.vscode-high-contrast-light .bar { outline: 1px solid var(--line); }
 /* Severity dots and the "New" tag in the findings list. */
 :root { --dot-c: #b83a17; --dot-h: #f6663a; --dot-m: #f2be22; --dot-l: #97948c; --new-bg: #b5daf5; --new: #1f4e7a; --ok-bg: oklch(87% 0.1 160); --ok: oklch(42% 0.09 162); }
+/* VEXIE (layout.css --color-vexie-*). */
+:root { --vexie-light: #cdebff; --vexie: #5aaef0; --vexie-deep: #2366b8; --vexie-eye: #1b1726; }
 body.vscode-dark { --new-bg: #1f4e7a; --new: #b5daf5; }
 body.vscode-high-contrast, body.vscode-high-contrast-light { --new-bg: transparent; --new: var(--vscode-foreground); --ok-bg: transparent; --ok: var(--vscode-foreground); }
 `;

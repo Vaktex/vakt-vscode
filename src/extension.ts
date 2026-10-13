@@ -1,7 +1,12 @@
 import * as vscode from "vscode";
+import { AccountTracker, AccountView } from "./account";
+import { CloudAuth } from "./auth";
+import { GraphHost } from "./graph/vscodeHost";
 import { LiveScorer, modelCached, resolveBinary, runPatrol, runResults, ScanError, ScanSettings, serveArgs } from "./cli";
+import { randomUUID } from "node:crypto";
+import { Capped, CloudClient, cloudLanguage, CloudReview, CloudVerdict, MAX_FUNCTION_CHARS, VerdictCache } from "./cloud";
 import { agentTarget, hasGrammar, reviewPrompt } from "./present";
-import { Unit } from "./report";
+import { sanitize, Unit } from "./report";
 import { Job, Scheduler } from "./scheduler";
 import { Ignores, IgnoreState } from "./ignores";
 import { FindingsView } from "./listView";
@@ -11,6 +16,8 @@ import { Diagnostics, fileUri, Gutter, Lenses, locate, readConfig, Reviews } fro
 
 const INSTALL_CMD = "curl -fsSL https://get.vaktex.com/oss-vakt | sh";
 const IGNORES_KEY = "vakt.ignores";
+const VERDICTS_KEY = "vakt.cloudVerdicts";
+const INSTALL_ID_KEY = "vakt.installId";
 
 export function activate(ctx: vscode.ExtensionContext): void {
   const log = vscode.window.createOutputChannel("VAKT", { log: true });
@@ -19,6 +26,79 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const ignores = new Ignores(ctx.workspaceState.get<IgnoreState>(IGNORES_KEY), (s) => ctx.workspaceState.update(IGNORES_KEY, s));
   store.hide = (root, u) => ignores.has(root, u);
   ctx.subscriptions.push(ignores.onDidChange(() => store.touch()));
+
+  // ---- cloud review (src/cloud.ts): off entirely with vakt.fullyLocal
+  const cloudAllowed = () => {
+    const c = vscode.workspace.getConfiguration("vakt");
+    const local = c.get("fullyLocal", false);
+    return { review: !local && c.get("improvedResponses", true), fix: !local };
+  };
+  // Sign-in to vaktex.com (src/auth.ts): the token lives in SecretStorage and only raises the spend cap.
+  const auth = new CloudAuth(ctx, log);
+  ctx.subscriptions.push(auth);
+  const cloud = new CloudClient({
+    version: String(ctx.extension.packageJSON.version ?? "0.0.0"),
+    log: (m) => log.info(m),
+    token: () => auth.token(),
+    onUnauthorized: () => auth.onUnauthorized(),
+    installId: installId(ctx),
+    onCapped: (c) => void showCapped(c),
+    // Already signed in (email not verified yet): the account line says what to do instead.
+    onLimited: () => void (auth.signedIn || showLimited()),
+    onResponse: () => account.refresh(),
+  });
+  // The account line in the sidebar: read on activation, on sign-in, and after cloud calls (throttled).
+  const account = new AccountTracker({
+    fetch: () => cloud.account(),
+    active: () => auth.signedIn && !vscode.workspace.getConfiguration("vakt").get("fullyLocal", false),
+    changed: () => list?.refresh(),
+  });
+  // Shown when something would use the account: cloud review, or (signed in) cloud fixes.
+  const accountView = (): AccountView | undefined => {
+    const allowed = cloudAllowed();
+    if (!allowed.review && !(allowed.fix && auth.signedIn)) return undefined;
+    return { signedIn: auth.signedIn, account: auth.signedIn ? account.account : undefined };
+  };
+  ctx.subscriptions.push(
+    auth.onDidChange((signedIn) => {
+      account.clear();
+      if (signedIn) account.refresh(true);
+      list?.refresh();
+    }),
+  );
+  const verdicts = new VerdictCache(ctx.globalState.get<Record<string, CloudVerdict>>(VERDICTS_KEY), (s) => ctx.globalState.update(VERDICTS_KEY, s));
+  ctx.subscriptions.push({ dispose: () => verdicts.flush() });
+  const review = new CloudReview({
+    client: cloud,
+    enabled: () => cloudAllowed().review,
+    read: async (root, u) => {
+      const uri = fileUri(root, u.file);
+      const open = vscode.workspace.textDocuments.find((d) => d.uri.toString() === uri.toString());
+      // An unopened file is read from disk rather than opened, which would fire open-document handlers.
+      const text = open ? open.getText() : Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
+      const lines = text.split(/\r?\n/);
+      if (u.end_line > lines.length) return undefined;
+      return { code: lines.slice(u.start_line - 1, u.end_line).join("\n"), language: cloudLanguage(u.language, open?.languageId) };
+    },
+    changed: () => render(),
+    cache: verdicts,
+    localModel: (root) => store.model(root)?.revision,
+    log: (m) => log.info(m),
+  });
+  const graph = new GraphHost({ context: ctx, store, client: cloud,
+    enabled: () => cloudAllowed().review,
+    refresh: () => review.refresh(store.candidates(readConfig())),
+    log: (message) => log.info(message),
+  });
+  ctx.subscriptions.push(graph);
+  store.view = (root, u, g) => review.view(root, u, g);
+  // An ignored finding is the user saying it is wrong or not worth fixing: worth knowing, with its code.
+  ctx.subscriptions.push(
+    ignores.onWillIgnore(({ root, file, unit }) => {
+      const shown = unit ? [unit] : store.fileFindings(root, file, readConfig());
+      void review.reportFeedback("ignore", root, unit ? "unit" : "file", shown);
+    }),
+  );
 
   const diagnostics = new Diagnostics(store);
   const lenses = new Lenses(store, readConfig);
@@ -45,7 +125,24 @@ export function activate(ctx: vscode.ExtensionContext): void {
     void panel.refresh();
     updateStatus();
   };
-  ctx.subscriptions.push(store.onDidChange(render));
+  // Functions DOM-0.8B passed are scored for importance (path and code) once results settle.
+  let sweepTimer: NodeJS.Timeout | undefined;
+  const sweepSoon = () => {
+    clearTimeout(sweepTimer);
+    sweepTimer = setTimeout(() => review.sweep(store.all(), readConfig()), 2_000);
+  };
+  // Verdicts already shown are re-checked by hash now and then: a better model or the crowd may know more.
+  const REFRESH_MS = 6 * 3_600_000;
+  const refreshTimers = [setTimeout(() => review.refresh(store.candidates(readConfig())), 60_000), setInterval(() => review.refresh(store.candidates(readConfig())), REFRESH_MS)];
+  ctx.subscriptions.push(
+    store.onDidChange(render),
+    // After render: anything new it held back is queued for review here.
+    store.onDidChange(() => {
+      review.validate(store.candidates(readConfig()));
+      sweepSoon();
+    }),
+    { dispose: () => [sweepTimer, ...refreshTimers].forEach((t) => clearTimeout(t)) },
+  );
 
   // ---- errors: one notification per distinct problem, everything else to the log
   let lastError: string | undefined;
@@ -133,13 +230,29 @@ export function activate(ctx: vscode.ExtensionContext): void {
       lastError = undefined;
       modelMissing = false;
       store.apply(job.root, rep, job.files);
+      cloudRescan(job);
+      if (!job.files && !signal.aborted) graph.schedule(job.root);
       log.info(
         `${rep.scan.units} units in ${rep.scan.files} files, ${rep.scan.cache_hits} cached, ` +
           `${Date.now() - started} ms (${rep.model.backend}, ${rep.model.device}, ${rep.model.precision})`,
       );
       for (const s of rep.scan.skipped ?? []) log.debug(`skipped ${s.file}: ${s.reason}`);
     } catch (e) {
+      for (const k of rescans) if (k.root === job.root) rescans.delete(k);
       await reportError(e);
+    }
+  };
+
+  // Files the user asked to rescan: once vakt has scored them, cloud review re-reviews every function.
+  const rescans = new Set<{ root: string; rel: string }>();
+  const cloudRescan = (job: Job) => {
+    for (const k of [...rescans]) {
+      if (k.root !== job.root || (job.files && !job.files.includes(k.rel))) continue;
+      rescans.delete(k);
+      if (!cloudAllowed().review) continue;
+      void vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: `VAKT: cloud review of ${k.rel.split("/").pop()}` }, () =>
+        review.rescan(k.root, store.units(k.root, k.rel), readConfig()),
+      );
     }
   };
   const scheduler = new Scheduler(runJob);
@@ -157,16 +270,19 @@ export function activate(ctx: vscode.ExtensionContext): void {
     hasResults: () => store.roots().length > 0,
     scanning: scanningLabel,
     ignored: () => ignores.size,
-    setup: () => ({ binary: binary() !== undefined, model: !modelMissing && (store.roots().length > 0 || modelCached()) }),
+    setup: () => ({
+      binary: binary() !== undefined,
+      model: !modelMissing && (store.roots().length > 0 || modelCached()),
+      // No step when nothing would use the account.
+      signedIn: cloudAllowed().review ? auth.signedIn : undefined,
+    }),
+    account: accountView,
     selected: () => panel.selection,
   });
   const updateStatus = () => {
     const n = store.findings(readConfig()).length;
-    if (scheduler.busy) {
-      status.text = "$(vakt-logo) $(sync~spin)";
-    } else {
-      status.text = `$(vakt-logo) ${n}`;
-    }
+    // A scan shows its own progress item ("VAKT: scanning …"); this one spins only for cloud review.
+    status.text = !scheduler.busy && review.pending > 0 ? "$(vakt-logo) $(sync~spin)" : `$(vakt-logo) ${n}`;
     if (lastError) status.text += " $(warning)";
     status.tooltip = lastError
       ? `VAKT: ${lastError}`
@@ -187,6 +303,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (!loc) {
       if (immediate) void vscode.window.showInformationMessage("VAKT scans files inside an open workspace folder.");
       return;
+    }
+    if (immediate) {
+      if (![...rescans].some((k) => k.root === loc.root && k.rel === loc.rel)) rescans.add(loc);
+      // Asking for a rescan says something about what was showing: report it as it was.
+      void review.reportFeedback("rescan", loc.root, "file", store.fileFindings(loc.root, loc.rel, readConfig()));
     }
     scheduler.enqueue({ root: loc.root, files: [loc.rel] }, immediate);
   };
@@ -259,6 +380,61 @@ export function activate(ctx: vscode.ExtensionContext): void {
   };
   void loadSaved();
 
+  // ---- cloud fixes: shown as a diff, applied only when the user accepts
+  const proposals = new Map<string, string>();
+  let proposalSeq = 0;
+  ctx.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider("vakt-fix", { provideTextDocumentContent: (uri) => proposals.get(uri.toString()) ?? "" }),
+  );
+  const copyPrompt = async (u: Unit, src: string, languageId: string, why: string) => {
+    await vscode.env.clipboard.writeText(reviewPrompt(u, src, languageId));
+    void vscode.window.showWarningMessage(`VAKT: ${why} The review prompt was copied instead; paste it into a coding agent.`);
+  };
+  const fixWithCloud = async (root: string, u: Unit) => {
+    const doc = await vscode.workspace.openTextDocument(fileUri(root, u.file));
+    const end = Math.min(u.end_line, doc.lineCount);
+    const range = new vscode.Range(u.start_line - 1, 0, end - 1, doc.lineAt(end - 1).text.length);
+    const original = doc.getText(range);
+    if (!cloudAllowed().fix) return copyPrompt(u, original, doc.languageId, "cloud fixes are off (VAKT: Fully Local).");
+    if (original.length > MAX_FUNCTION_CHARS) return copyPrompt(u, original, doc.languageId, "this function is too long for a cloud fix.");
+
+    let fix;
+    try {
+      fix = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `VAKT: writing a fix for ${sanitize(u.name, 80) || `line ${u.start_line}`}…` },
+        () => cloud.fix({ language: cloudLanguage(u.language, doc.languageId), code: original, family: u.top_family, explanation: u.cloud ? u.explanation : undefined }),
+      );
+    } catch (e) {
+      log.warn(`cloud fix: ${(e as Error).message}`);
+      return copyPrompt(u, original, doc.languageId, "the cloud could not write a fix right now.");
+    }
+    if (!fix.fixed) return void vscode.window.showInformationMessage(`VAKT: no change needed. ${sanitize(fix.summary, 300)}`);
+
+    const eol = doc.eol === vscode.EndOfLine.CRLF ? "\r\n" : "\n";
+    const code = fix.code.replace(/\r?\n/g, eol);
+    const whole = doc.getText();
+    const proposed = whole.slice(0, doc.offsetAt(range.start)) + code + whole.slice(doc.offsetAt(range.end));
+    const right = vscode.Uri.from({ scheme: "vakt-fix", path: doc.uri.path, query: String(++proposalSeq) });
+    proposals.set(right.toString(), proposed);
+    try {
+      await vscode.commands.executeCommand("vscode.diff", doc.uri, right, `${u.file.split("/").pop()} ↔ VAKT fix`, { preview: true });
+      const pick = await vscode.window.showInformationMessage(`VAKT fix: ${sanitize(fix.summary, 300)}`, "Accept", "Reject");
+      if (pick === "Accept") {
+        if (doc.getText(range) !== original) {
+          void vscode.window.showWarningMessage("VAKT: the function changed while the fix was open, so it was not applied.");
+        } else {
+          const edit = new vscode.WorkspaceEdit();
+          edit.replace(doc.uri, range, code);
+          if (await vscode.workspace.applyEdit(edit)) void vscode.window.setStatusBarMessage("VAKT: fix applied. Review and save the file.", 5000);
+        }
+      }
+    } finally {
+      const tabs = vscode.window.tabGroups.all.flatMap((g) => g.tabs).filter((t) => t.input instanceof vscode.TabInputTextDiff && t.input.modified.toString() === right.toString());
+      if (tabs.length) await vscode.window.tabGroups.close(tabs);
+      proposals.delete(right.toString());
+    }
+  };
+
   // ---- providers and views
   ctx.subscriptions.push(
     vscode.languages.registerCodeLensProvider({ scheme: "file" }, lenses),
@@ -285,8 +461,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
       if (!folders.length) return void vscode.window.showInformationMessage("Open a folder to scan it with vakt.");
       for (const f of folders) if (f.uri.scheme === "file") scheduler.enqueue({ root: f.uri.fsPath }, true);
     }),
-    vscode.commands.registerCommand("vakt.cancel", () => scheduler.cancel()),
-    vscode.commands.registerCommand("vakt.clear", () => store.clear()),
+    vscode.commands.registerCommand("vakt.uploadGraph", async () => {
+      for (const folder of vscode.workspace.workspaceFolders ?? []) {
+        if (folder.uri.scheme === "file") await graph.upload(folder.uri.fsPath, true);
+      }
+    }),
+    vscode.commands.registerCommand("vakt.cancel", () => { scheduler.cancel(); graph.cancel(); }),
+    vscode.commands.registerCommand("vakt.clear", () => {
+      review.clear();
+      store.clear();
+    }),
     vscode.commands.registerCommand("vakt.setup", () => terminalCommand("vakt summon", ["summon"])),
     vscode.commands.registerCommand("vakt.doctor", () => terminalCommand("vakt doctor", ["doctor"])),
     vscode.commands.registerCommand("vakt.showOutput", () => log.show()),
@@ -331,9 +515,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
       } catch (e) {
         log.warn(`could not open the agent (${target}): ${(e as Error).message}`);
       }
+      // No agent in this editor: VAKT Cloud writes the fix, unless the user keeps everything local.
+      if (cloudAllowed().fix) return void vscode.commands.executeCommand("vakt.fixWithCloud", root, u);
       await vscode.env.clipboard.writeText(prompt);
       void vscode.window.showInformationMessage("VAKT: no chat agent found here, so the review prompt was copied. Paste it into your coding agent.");
     }),
+    vscode.commands.registerCommand("vakt.fixWithCloud", (root: string, u: Unit) => fixWithCloud(root, u)),
     vscode.commands.registerCommand("vakt.copyReviewPrompt", async (root: string, u: Unit) => {
       const doc = await vscode.workspace.openTextDocument(fileUri(root, u.file));
       const end = Math.min(u.end_line, doc.lineCount);
@@ -363,8 +550,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }),
     { dispose: () => live?.stop() },
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("vakt.threshold") || e.affectsConfiguration("vakt.minConfidence") || e.affectsConfiguration("vakt.diagnosticSeverity")) {
-        render(); // gates are re-applied locally: no re-scan needed
+      if (e.affectsConfiguration("vakt.fullyLocal") || e.affectsConfiguration("vakt.improvedResponses")) graph.cancel();
+      if (["vakt.threshold", "vakt.minConfidence", "vakt.diagnosticSeverity", "vakt.improvedResponses", "vakt.fullyLocal"].some((k) => e.affectsConfiguration(k))) {
+        render(); // gates and cloud verdicts are re-applied locally: no re-scan needed
+        review.validate(store.candidates(readConfig()));
+        account.refresh();
       }
       if (["vakt.path", "vakt.threshold", "vakt.minConfidence", "vakt.precision", "vakt.device", "vakt.topLevel"].some((k) => e.affectsConfiguration(k))) {
         // Restarted with the new settings on the next edit.
@@ -377,7 +567,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
     }),
     vscode.workspace.onDidChangeWorkspaceFolders((e) => {
-      for (const f of e.removed) store.clear(f.uri.fsPath);
+      graph.cancel();
+      for (const f of e.removed) {
+        review.clear(f.uri.fsPath);
+        store.clear(f.uri.fsPath);
+      }
     }),
     // Re-anchor diagnostics to the real signature line once the document text is available.
     vscode.workspace.onDidOpenTextDocument(() => diagnostics.render(readConfig())),
@@ -391,4 +585,30 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   // Subscriptions (including the scheduler's cancel) are disposed by VS Code.
+}
+
+/** A random id for this install, created once (sent as `x-vakt-install`; the cloud's spend cap counts by it). */
+function installId(ctx: vscode.ExtensionContext): string {
+  let id = ctx.globalState.get<string>(INSTALL_ID_KEY);
+  if (!id) {
+    id = randomUUID();
+    void ctx.globalState.update(INSTALL_ID_KEY, id);
+  }
+  return id;
+}
+
+/** Once per pause (CloudClient calls it once): today's limit is reached, and signing in raises it. */
+// The pause may be shorter than the day (Retry-After), so no time is promised.
+async function showLimited(): Promise<void> {
+  const pick = await vscode.window.showInformationMessage("VAKT cloud review has reached today's limit. Local results continue. Signing in raises it.", "Sign in");
+  if (pick === "Sign in") await vscode.commands.executeCommand("vakt.signIn").then(undefined, () => undefined);
+}
+
+/** Once per pause (CloudClient calls it once): the month's free cloud budget is spent. */
+async function showCapped(c: Capped): Promise<void> {
+  const date = new Date(c.resetsAt).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric", timeZone: "UTC" });
+  const message = `VAKT cloud review has reached this month's free limit. Local results continue. Resets ${date}.`;
+  const pick = c.signIn ? await vscode.window.showInformationMessage(message, "Sign In") : await vscode.window.showInformationMessage(message);
+  // vakt.signIn is registered by the sign-in code (src/auth.ts); missing is harmless.
+  if (pick === "Sign In") await vscode.commands.executeCommand("vakt.signIn").then(undefined, () => undefined);
 }
