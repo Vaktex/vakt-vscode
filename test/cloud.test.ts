@@ -122,6 +122,39 @@ test("cloud: a rescan can add a function DOM-0.8B passed", async () => {
   assert.equal(JSON.parse(t.sent[0].body).functions[0].local.flagged, false);
 });
 
+test("cloud: a rescan keeps a confirmed finding while in flight and when the cloud errors", async () => {
+  let answer: (b: { functions?: { id: string }[] }) => Answer = verdict("confirm", ["data_neutralization"]);
+  const t = setup((b) => answer(b));
+  t.store.setFile("/r", "src/app.py", [unit()]);
+  t.review.validate(t.store.candidates(G));
+  await t.settled;
+  assert.equal(t.store.findings(G).length, 1);
+  answer = (b) => ({ body: { engine: "m", results: (b.functions ?? []).map((f) => ({ id: f.id, operation: "error" })) } });
+  const rescanning = t.review.rescan("/r", t.store.units("/r", "src/app.py"), G);
+  assert.equal(t.store.findings(G).length, 1, "in flight: still shown");
+  assert.equal(t.review.held(t.store.candidates(G)), 0);
+  await rescanning;
+  assert.equal(t.store.findings(G)[0].unit.cloud?.operation, "confirm", "error: old verdict kept");
+});
+
+test("cloud: one rescan reject disputes a confirmed finding; a second removes it", async () => {
+  let answer: (b: { functions?: { id: string }[] }) => Answer = verdict("confirm", ["data_neutralization"]);
+  const t = setup((b) => answer(b));
+  t.store.setFile("/r", "src/app.py", [unit()]);
+  t.review.validate(t.store.candidates(G));
+  await t.settled;
+  answer = verdict("reject");
+  await t.review.rescan("/r", t.store.units("/r", "src/app.py"), G);
+  assert.equal(t.store.findings(G)[0].unit.cloud?.operation, "confirm", "one reject: kept");
+  // A refresh that comes back rejected (the server saved the rescan's answer) does not remove it either.
+  t.review.refresh(t.store.findings(G));
+  while (t.review.pending > 0 || t.sent.length < 3) await new Promise((r) => setTimeout(r, 1));
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(t.store.findings(G).length, 1, "refresh: kept");
+  await t.review.rescan("/r", t.store.units("/r", "src/app.py"), G);
+  assert.equal(t.store.findings(G).length, 0, "second reject: removed");
+});
+
 test("cloud: an outage holds findings back, pauses further calls, and asks again later", async () => {
   let down = true;
   const t = setup((b) => (down ? new Error("ECONNREFUSED") : verdict("reject")(b)));

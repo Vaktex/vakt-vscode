@@ -385,12 +385,25 @@ export interface ReviewDeps {
   log?: (m: string) => void;
 }
 
-/** `quiet`: a background check (an important function DOM-0.8B passed); not shown as busy. */
+/**
+ * `disputed`: a rescan rejected a finding the cloud had shown; it stays shown
+ * until a second rescan rejects it too.
+ */
+type Done = { sig: string; state: "done"; verdict: CloudVerdict; disputed?: boolean };
+
+/**
+ * `quiet`: a background check (an important function DOM-0.8B passed); not shown as busy.
+ * `prev`: the verdict a rescan is asking again about, shown until a new one arrives.
+ */
 type Entry =
-  | { sig: string; state: "pending"; quiet?: boolean }
+  | { sig: string; state: "pending"; quiet?: boolean; prev?: Done }
   /** `until`: when to ask again; never, for code the cloud cannot take (too long, unreadable). */
-  | { sig: string; state: "failed"; until: number }
-  | { sig: string; state: "done"; verdict: CloudVerdict };
+  | { sig: string; state: "failed"; until: number; prev?: Done }
+  | Done;
+
+/** The verdict to show for an entry: its own, or the one a rescan is still asking again about. */
+const shownVerdict = (e: Entry | undefined, sig: string): Done | undefined =>
+  e?.sig !== sig ? undefined : e.state === "done" ? e : e.prev;
 
 /**
  * validate   DOM-0.8B's findings, held back until checked
@@ -480,10 +493,7 @@ export class CloudReview {
   held(findings: readonly { root: string; unit: Unit }[]): number {
     if (!this.deps.enabled() || this.deps.client.stopped) return 0;
     let n = 0;
-    for (const { root, unit } of findings) {
-      const e = this.entries.get(unitKey(root, unit));
-      if (e?.state !== "done" || e.sig !== unitSig(unit)) n++;
-    }
+    for (const { root, unit } of findings) if (!shownVerdict(this.entries.get(unitKey(root, unit)), unitSig(unit))) n++;
     return n;
   }
 
@@ -491,9 +501,10 @@ export class CloudReview {
   view(root: string, u: Unit, g: Gates): Unit | undefined {
     const local = isFinding(u, g);
     if (!this.deps.enabled()) return local ? u : undefined;
-    const e = this.entries.get(unitKey(root, u));
     // No verdict (not reviewed yet, pending, or the cloud could not answer): held back.
-    if (!e || e.sig !== unitSig(u) || e.state !== "done") return local && this.deps.client.stopped ? u : undefined;
+    // A rescan in flight, or one the cloud could not answer, keeps the verdict it asked again about.
+    const e = shownVerdict(this.entries.get(unitKey(root, u)), unitSig(u));
+    if (!e) return local && this.deps.client.stopped ? u : undefined;
     const v = e.verdict;
     switch (v.operation) {
       case "reject":
@@ -519,7 +530,7 @@ export class CloudReview {
       findings.filter(({ root, unit }) => {
         const e = this.entries.get(unitKey(root, unit));
         if (e && e.sig === unitSig(unit) && !(e.state === "failed" && e.until <= this.now())) return false;
-        this.entries.set(unitKey(root, unit), { sig: unitSig(unit), state: "pending" });
+        this.entries.set(unitKey(root, unit), { sig: unitSig(unit), state: "pending", prev: shownVerdict(e, unitSig(unit)) });
         return true;
       }),
       () => true,
@@ -561,7 +572,10 @@ export class CloudReview {
   rescan(root: string, units: readonly Unit[], g: Gates): Promise<void> {
     if (!this.deps.enabled() || !units.length) return Promise.resolve();
     const picked = [...units].sort((a, b) => b.severity - a.severity).slice(0, RESCAN_MAX);
-    for (const unit of picked) this.entries.set(unitKey(root, unit), { sig: unitSig(unit), state: "pending" });
+    for (const unit of picked) {
+      const k = unitKey(root, unit);
+      this.entries.set(k, { sig: unitSig(unit), state: "pending", prev: shownVerdict(this.entries.get(k), unitSig(unit)) });
+    }
     this.deps.changed();
     return new Promise((resolve) => this.enqueue({ mode: "rescan", root, units: picked.map((unit) => ({ unit, flagged: isFinding(unit, g) })) }, true, resolve));
   }
@@ -665,8 +679,20 @@ export class CloudReview {
 
   private async run(t: Task): Promise<void> {
     // A refresh never downgrades what is shown: if the cloud cannot answer, the old verdict stays.
-    const fail = (u: Unit, until = this.now() + RETRY_MS) => t.mode !== "refresh" && this.settle(t.root, u, { sig: unitSig(u), state: "failed", until });
-    const doneWith = (u: Unit, verdict: CloudVerdict) => this.settle(t.root, u, { sig: unitSig(u), state: "done", verdict });
+    const prevOf = (u: Unit) => shownVerdict(this.entries.get(unitKey(t.root, u)), unitSig(u));
+    const fail = (u: Unit, until = this.now() + RETRY_MS) =>
+      t.mode !== "refresh" && this.settle(t.root, u, { sig: unitSig(u), state: "failed", until, prev: prevOf(u) });
+    const doneWith = (u: Unit, verdict: CloudVerdict) => {
+      const prev = prevOf(u);
+      // One reject does not take away a finding the cloud showed: a rescan marks it disputed,
+      // only a second rescan removes it, and nothing else (a refresh, say) removes it meanwhile.
+      if (verdict.operation === "reject" && prev && prev.verdict.operation !== "reject" && (t.mode !== "rescan" ? prev.disputed : !prev.disputed)) {
+        if (t.mode === "rescan") this.deps.log?.(`cloud review: rescan disputes ${u.name ?? `line ${u.start_line}`} in ${u.file}; kept until a second rescan agrees`);
+        this.settle(t.root, u, { ...prev, sig: unitSig(u), disputed: true });
+        return;
+      }
+      this.settle(t.root, u, { sig: unitSig(u), state: "done", verdict });
+    };
 
     let items: Item[] = [];
     for (const { unit, flagged } of t.units) {
