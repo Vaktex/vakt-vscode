@@ -6,7 +6,7 @@
 // not look like a vakt v1 report, and the helpers below keep repo-controlled
 // strings from escaping the scan root or smuggling control characters into UI.
 
-import { isFamily } from "./families";
+import { isFamily, withTopFamily } from "./families";
 
 export const SCHEMA_VERSION = "1";
 
@@ -117,6 +117,7 @@ export function parseReport(text: string): Report {
   }
   if (!Array.isArray(r.units)) throw new ReportError("report has no units array");
   r.units.forEach((u, i) => checkUnit(u, i));
+  r.units = r.units.map(withTopFamily);
   if (!r.scan || typeof r.scan !== "object") throw new ReportError("report has no scan section");
   return r as Report;
 }
@@ -124,7 +125,7 @@ export function parseReport(text: string): Report {
 /** Validate one unit (a streamed `unit` event or a `vakt serve` result). Throws ReportError. */
 export function parseUnit(raw: unknown): Unit {
   checkUnit(raw as Unit, 0);
-  return raw as Unit;
+  return withTopFamily(raw as Unit);
 }
 
 function checkUnit(u: Unit, i: number): void {

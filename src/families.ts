@@ -77,12 +77,13 @@ const ISSUES: Record<Family, Issue> = {
     summary: "A broken or risky cryptographic algorithm may be in use.",
     description: "The product uses a broken or risky cryptographic algorithm or protocol.",
   },
+  // Improper neutralization in general: SQL, commands, templates, markup. Not only SQL.
   data_neutralization: {
-    title: "SQL injection",
-    cwe: "CWE-89",
-    summary: "Untrusted input may reach a SQL query without being escaped or parameterised.",
+    title: "Injection",
+    cwe: "CWE-74",
+    summary: "Untrusted input may reach a query, command or page without being escaped.",
     description:
-      "The product constructs all or part of an SQL command using externally-influenced input from an upstream component, but it does not neutralize or incorrectly neutralizes special elements that could modify the intended SQL command when it is sent to a downstream component.",
+      "The product constructs all or part of a command, data structure, or record using externally-influenced input from an upstream component, but it does not neutralize or incorrectly neutralizes special elements that could modify how it is parsed or interpreted when it is sent to a downstream component.",
   },
   data_processing: {
     title: "Unsafe data processing",
@@ -185,7 +186,7 @@ export function issueFor(family: string): Issue {
   return isFamily(family) ? ISSUES[family] : { ...ISSUES.other, title: family || ISSUES.other.title };
 }
 
-/** "SQL injection (CWE-89)", or the title alone when no single CWE fits. */
+/** "Injection (CWE-74)", or the title alone when no single CWE fits. */
 export function displayTitle(family: string): string {
   const { title, cwe } = issueFor(family);
   return cwe ? `${title} (${cwe})` : title;
@@ -205,17 +206,41 @@ export interface RankedFamily {
 }
 
 /**
+ * A family and the broader one it is a kind of (vakt's labels.Narrower). XSS
+ * is an improper neutralization, and the model scores both on the same code,
+ * the broad one higher: once XSS clears its own cut-off it names the finding.
+ */
+const NARROWER: Partial<Record<Family, Family>> = { web_security: "data_neutralization" };
+
+/**
  * Families ordered the way vakt picks top_family: by how far each clears its
- * cut-off, not by raw probability (rare families have cut-offs far below 0.5).
+ * cut-off, not by raw probability (rare families have cut-offs far below 0.5),
+ * with a narrower family that clears its cut-off ahead of its broader one.
  */
 export function rankFamilies(probs: Partial<Record<string, number>>, n = 3): RankedFamily[] {
-  return FAMILIES.map((family) => {
+  const ranked = FAMILIES.map((family) => {
     const prob = probs[family] ?? 0;
     const cutoff = DEFAULT_THRESHOLDS[family];
     return { family, prob, cutoff, ratio: prob / cutoff };
-  })
-    .sort((a, b) => b.ratio - a.ratio)
-    .slice(0, n);
+  }).sort((a, b) => b.ratio - a.ratio);
+  for (const [narrow, broad] of Object.entries(NARROWER) as [Family, Family][]) {
+    const i = ranked.findIndex((r) => r.family === narrow);
+    const j = ranked.findIndex((r) => r.family === broad);
+    if (j < i && ranked[i].ratio >= 1) ranked.splice(j, 0, ...ranked.splice(i, 1));
+  }
+  return ranked.slice(0, n);
+}
+
+/**
+ * The unit with top_family chosen as vakt now chooses it. Results stored by
+ * an older vakt named the broad family; re-ranking keeps them consistent.
+ */
+export function withTopFamily<T extends { families: Partial<Record<string, number>>; top_family: string; top_family_prob: number }>(u: T): T {
+  if (!u.top_family) return u;
+  const [top] = rankFamilies(u.families, 1);
+  return top && top.family !== u.top_family && NARROWER[top.family] === u.top_family
+    ? { ...u, top_family: top.family, top_family_prob: top.prob }
+    : u;
 }
 
 /** CRITICAL / HIGH / MEDIUM / LOW, matching report.SeverityLabel. */

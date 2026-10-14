@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { classifyError, escapeGlob, JsonlReader, LiveScorer, modelCached, patrolArgs, resolveBinary, runPatrol, runResults, ScanError, ScanSettings, serveArgs } from "../src/cli";
-import { DEFAULT_THRESHOLDS, FAMILIES, rankFamilies } from "../src/families";
+import { DEFAULT_THRESHOLDS, FAMILIES, rankFamilies, withTopFamily } from "../src/families";
 import { agentTarget, diagnosticMessage, hasGrammar, reviewPrompt, unitName } from "../src/present";
 import { isFinding, isSafeRelPath, parseReport, Report, sanitize, Unit } from "../src/report";
 import { Scheduler } from "../src/scheduler";
@@ -289,9 +289,9 @@ test("detail panel escapes repo-controlled strings and locks down the CSP", () =
   assert.equal((html.match(/<script/g) ?? []).length, 1, "only our nonce'd script");
   assert.match(html, /default-src 'none'/);
   assert.match(html, /script-src 'nonce-N0NCE'/);
-  assert.match(html, /SQL injection/);
-  assert.match(html, /CWE-89/);
-  assert.match(html, /constructs all or part of an SQL command/, "CWE description");
+  assert.match(html, /Injection/);
+  assert.match(html, /CWE-74/);
+  assert.match(html, /constructs all or part of a command, data structure, or record/, "CWE description");
   assert.match(html, /data-cmd="review"[^>]*>Resolve</);
   assert.match(html, />Critical</, "severity tag carries the level only");
 });
@@ -324,9 +324,9 @@ test("unnamed units are named by their line", () => {
 });
 
 test("presentation strings", () => {
-  assert.equal(diagnosticMessage(unit()), "SQL injection (CWE-89): Untrusted input may reach a SQL query without being escaped or parameterised.");
+  assert.equal(diagnosticMessage(unit()), "Injection (CWE-74): Untrusted input may reach a query, command or page without being escaped.");
   assert.ok(!/severity|confidence|CRITICAL|\d\.\d/.test(diagnosticMessage(unit())), "no scores in the message");
-  assert.equal(diagnosticMessage(unit({ explanation: "q flows into\u202E execute" })), "SQL injection (CWE-89): q flows into execute");
+  assert.equal(diagnosticMessage(unit({ explanation: "q flows into\u202E execute" })), "Injection (CWE-74): q flows into execute");
   assert.ok(reviewPrompt(unit(), "a ``` b", "python").includes("~~~~python"));
   assert.ok(hasGrammar("src/x.tsx") && !hasGrammar("README.md") && !hasGrammar("Makefile"));
 });
@@ -430,4 +430,16 @@ test("listHtml: a clean scan gets its own page, with happy VEXIE", () => {
   // Still scanning: the list, not this page.
   assert.match(listBody({ ...base, scanning: "codebase" }), /data-filter/);
   assert.match(listShape(base), /^clear:/);
+});
+
+test("families: XSS names the finding over the broader injection family once it clears its cut-off", () => {
+  // The screenshot case: injection 0.98, XSS 0.93.
+  const probs = { data_neutralization: 0.98, web_security: 0.93 };
+  assert.deepEqual(rankFamilies(probs, 2).map((r) => r.family), ["web_security", "data_neutralization"]);
+  const stored = { families: probs, top_family: "data_neutralization", top_family_prob: 0.98 };
+  assert.deepEqual(withTopFamily(stored), { ...stored, top_family: "web_security", top_family_prob: 0.93 });
+  // Under its cut-off, XSS does not take over.
+  const weak = { families: { data_neutralization: 0.98, web_security: 0.3 }, top_family: "data_neutralization", top_family_prob: 0.98 };
+  assert.equal(withTopFamily(weak), weak);
+  assert.equal(rankFamilies(weak.families, 1)[0].family, "data_neutralization");
 });
