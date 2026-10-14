@@ -15,7 +15,7 @@
 - **Cloud fixes**: in an editor with no coding agent, *Resolve* gets a fix from the cloud and shows it as a diff to accept or reject.
 - With improved cloud responses on, ignoring a finding or rescanning its file reports it (the redacted function and what the finding said) to help improve DOM-0.8B.
 - **Fully local** (`vakt.fullyLocal`): never contact the cloud.
-- Any cloud error, rate limit or outage falls back to DOM-0.8B's own results.
+- With cloud review on, a finding is shown only once the cloud has reviewed it. During an outage or a short pause findings are held back and asked about again every two minutes (the status bar says how many are waiting). Stopped at a limit for hours, DOM-0.8B's own results show meanwhile.
 
 ## 0.1.0
 

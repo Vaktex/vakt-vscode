@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { canonicalCode, CloudClient, CloudError, CloudReview, cloudLanguage, codeMd5, IMPORTANT_PER_HOUR, parseVerdict, ReviewDeps, VerdictCache } from "../src/cloud";
-import { MAX_CAP_PAUSE_MS } from "../src/cloud";
+import { MAX_CAP_PAUSE_MS, MAX_FUNCTION_CHARS } from "../src/cloud";
 import { detailHtml } from "../src/detailHtml";
 import { importance, IMPORTANT } from "../src/heuristics";
 import { FAMILIES } from "../src/families";
@@ -74,7 +74,7 @@ function setup(answer: (body: { functions?: { id: string }[] }) => Answer, enabl
       done();
     },
   };
-  const review = new CloudReview(deps);
+  const review = new CloudReview({ ...deps, now: () => now });
   const store = new ResultStore();
   store.view = (root, u, g) => review.view(root, u, g);
   return { review, store, client, sent: f.sent, settled, changes: () => changes, advance: (ms: number) => (now += ms) };
@@ -122,20 +122,53 @@ test("cloud: a rescan can add a function DOM-0.8B passed", async () => {
   assert.equal(JSON.parse(t.sent[0].body).functions[0].local.flagged, false);
 });
 
-test("cloud: an outage shows the local finding and pauses further calls", async () => {
-  const t = setup(() => new Error("ECONNREFUSED"));
+test("cloud: an outage holds findings back, pauses further calls, and asks again later", async () => {
+  let down = true;
+  const t = setup((b) => (down ? new Error("ECONNREFUSED") : verdict("reject")(b)));
   t.store.setFile("/r", "src/app.py", [unit()]);
   t.review.validate(t.store.candidates(G));
   await t.settled;
-  assert.equal(t.store.findings(G).length, 1, "falls back to DOM-0.8B");
+  assert.equal(t.store.findings(G).length, 0, "never shown unreviewed");
   assert.equal(t.client.available, false);
-  // While paused, new findings show at once and nothing is sent.
+  // While paused, new findings are held back too and nothing is sent.
   t.store.setFile("/r", "src/b.py", [unit({ file: "src/b.py" })]);
   t.review.validate(t.store.candidates(G));
-  assert.equal(t.store.findings(G).length, 2);
+  assert.equal(t.store.findings(G).length, 0);
+  assert.equal(t.review.held(t.store.candidates(G)), 2);
   assert.equal(t.sent.length, 1);
+  // Back up: both are reviewed, and the cloud says neither is real.
+  down = false;
   t.advance(5 * 60_000);
   assert.equal(t.client.available, true);
+  t.review.validate(t.store.candidates(G));
+  while (t.review.pending > 0) await new Promise((r) => setTimeout(r, 1));
+  assert.deepEqual(t.sent.slice(1).map((r) => r.url.split("/").pop()), ["lookup", "review", "lookup", "review"]);
+  assert.equal(t.store.findings(G).length, 0);
+  assert.equal(t.review.held(t.store.candidates(G)), 0);
+});
+
+test("cloud: code the cloud cannot take is held back and not asked about again", async () => {
+  const t = setup(verdict("confirm", ["data_neutralization"]));
+  t.review["deps"].read = async () => ({ code: "x".repeat(MAX_FUNCTION_CHARS + 1), language: "Python" });
+  t.store.setFile("/r", "src/app.py", [unit()]);
+  t.review.validate(t.store.candidates(G));
+  await t.settled;
+  assert.equal(t.store.findings(G).length, 0);
+  t.advance(60 * 60_000);
+  t.review.validate(t.store.candidates(G));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(t.sent.length, 0);
+  assert.equal(t.review.held(t.store.candidates(G)), 1);
+});
+
+test("cloud: stopped at a limit for hours, local findings show meanwhile", async () => {
+  const t = setup(() => ({ status: 402, body: { error: "limit", resetsAt: new Date(1_000_000 + 10 * 86_400_000).toISOString() } }));
+  t.store.setFile("/r", "src/app.py", [unit()]);
+  t.review.validate(t.store.candidates(G));
+  await t.settled;
+  assert.equal(t.client.stopped, true);
+  assert.equal(t.store.findings(G).length, 1);
+  assert.equal(t.review.held(t.store.candidates(G)), 0);
 });
 
 test("cloud: disabled means local results and no requests", () => {

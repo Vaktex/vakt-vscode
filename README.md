@@ -54,7 +54,7 @@ Scoring is local: DOM-0.8B runs on your machine through `vakt`. **Cloud review i
 
 ### What cloud review does
 
-Vaktex cloud models review each flagged function, every function in a file you *Rescan*, and functions DOM-0.8B passed that look security-relevant (request handlers, auth, SQL, shell commands and the like). A finding the review rejects is not shown, one it relabels shows its label, and one it finds is added. Each function is looked up by an MD5 hash of its anonymised code first; if it has been reviewed before, by anyone, that answer is used and the code is not sent again. If the cloud is unreachable, busy or over its limit, you get DOM-0.8B's results as usual.
+Vaktex cloud models review each flagged function, every function in a file you *Rescan*, and functions DOM-0.8B passed that look security-relevant (request handlers, auth, SQL, shell commands and the like). A finding the review rejects is not shown, one it relabels shows its label, and one it finds is added. Each function is looked up by an MD5 hash of its anonymised code first; if it has been reviewed before, by anyone, that answer is used and the code is not sent again. Nothing is shown before it has been reviewed: if the cloud is unreachable or busy, findings wait and are asked about again (the status bar says how many). Over a limit that lasts hours, you get DOM-0.8B's results as usual.
 
 In an editor with no coding agent, *Resolve* asks the cloud for a fix to that one function and shows it as a diff, which you accept or reject. Your real names are put back into the fix on your machine.
 

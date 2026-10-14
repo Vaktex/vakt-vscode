@@ -101,6 +101,9 @@ export class CloudError extends Error {
 }
 
 /** How long to stop calling after a refusal, by status. 0: only this request failed. */
+/** A pause longer than this is a limit, not an outage: local results show meanwhile. */
+export const LONG_PAUSE_MS = 3_600_000;
+
 function backoffMs(status: number, retryAfter: string | null): number {
   const after = Number(retryAfter);
   const told = Number.isFinite(after) && after > 0 ? Math.min(after, 86_400) * 1000 : 0;
@@ -149,6 +152,11 @@ export class CloudClient {
   /** False while backing off after a refusal or an outage. */
   get available(): boolean {
     return this.now() >= this.blockedUntil;
+  }
+
+  /** Paused for longer than a blip (this month's or today's limit, blocked): the cloud will not answer soon. */
+  get stopped(): boolean {
+    return this.blockedUntil - this.now() > LONG_PAUSE_MS;
   }
 
   private cappedAt: Capped | undefined;
@@ -380,7 +388,8 @@ export interface ReviewDeps {
 /** `quiet`: a background check (an important function DOM-0.8B passed); not shown as busy. */
 type Entry =
   | { sig: string; state: "pending"; quiet?: boolean }
-  | { sig: string; state: "failed" }
+  /** `until`: when to ask again; never, for code the cloud cannot take (too long, unreadable). */
+  | { sig: string; state: "failed"; until: number }
   | { sig: string; state: "done"; verdict: CloudVerdict };
 
 /**
@@ -396,6 +405,9 @@ interface Task {
   root: string;
   units: { unit: Unit; flagged: boolean }[];
 }
+
+/** How long a finding the cloud could not answer for waits before it is asked about again. */
+export const RETRY_MS = 2 * 60_000;
 
 /** Background reviews (mode important) per hour, on top of the server's own quotas. */
 export const IMPORTANT_PER_HOUR = 40;
@@ -432,9 +444,12 @@ interface Item {
 /**
  * Decides, per unit, what the editor shows once the cloud has had its say.
  *
- * A local finding is held back while its verdict is pending, so a finding the
- * cloud rejects never appears. If the cloud cannot answer (disabled, paused,
- * offline, the function too long) the local finding shows as it always did.
+ * A local finding is shown only once the cloud has confirmed it, so a finding
+ * the cloud rejects never appears. While the cloud cannot answer (offline, an
+ * error, a short pause) findings stay held back and are asked about again; code
+ * it can never take (too long) stays held back too. held() counts them. With
+ * cloud review off (or Fully local), or stopped for hours at a limit, the local
+ * findings show as they always did.
  *
  * The cloud is asked by hash first (/api/vakt/lookup): a function anyone has
  * had reviewed comes back without sending code, and one reviewed by an older
@@ -461,17 +476,24 @@ export class CloudReview {
     return n;
   }
 
+  /** Local findings with no verdict yet: queued, waiting on the cloud, or code it cannot take. */
+  held(findings: readonly { root: string; unit: Unit }[]): number {
+    if (!this.deps.enabled() || this.deps.client.stopped) return 0;
+    let n = 0;
+    for (const { root, unit } of findings) {
+      const e = this.entries.get(unitKey(root, unit));
+      if (e?.state !== "done" || e.sig !== unitSig(unit)) n++;
+    }
+    return n;
+  }
+
   /** The unit to show for `u`, or undefined to show nothing. */
   view(root: string, u: Unit, g: Gates): Unit | undefined {
     const local = isFinding(u, g);
     if (!this.deps.enabled()) return local ? u : undefined;
     const e = this.entries.get(unitKey(root, u));
-    if (!e || e.sig !== unitSig(u)) {
-      // Not reviewed yet: validate() is about to queue it, unless calls are paused.
-      return local && !this.deps.client.available ? u : undefined;
-    }
-    if (e.state === "pending") return undefined;
-    if (e.state === "failed") return local ? u : undefined;
+    // No verdict (not reviewed yet, pending, or the cloud could not answer): held back.
+    if (!e || e.sig !== unitSig(u) || e.state !== "done") return local && this.deps.client.stopped ? u : undefined;
     const v = e.verdict;
     switch (v.operation) {
       case "reject":
@@ -486,14 +508,17 @@ export class CloudReview {
     }
   }
 
-  /** Queue DOM-0.8B's findings that have no current verdict. Call whenever results change. */
+  /**
+   * Queue DOM-0.8B's findings that have no current verdict, and those the cloud
+   * could not answer for a while ago. Call whenever results change, and now and then.
+   */
   validate(findings: readonly { root: string; unit: Unit }[]): void {
     if (!this.deps.enabled() || !this.deps.client.available) return;
     const tasks = this.byFile(
       "validate",
       findings.filter(({ root, unit }) => {
         const e = this.entries.get(unitKey(root, unit));
-        if (e && e.sig === unitSig(unit)) return false;
+        if (e && e.sig === unitSig(unit) && !(e.state === "failed" && e.until <= this.now())) return false;
         this.entries.set(unitKey(root, unit), { sig: unitSig(unit), state: "pending" });
         return true;
       }),
@@ -640,13 +665,17 @@ export class CloudReview {
 
   private async run(t: Task): Promise<void> {
     // A refresh never downgrades what is shown: if the cloud cannot answer, the old verdict stays.
-    const fail = (u: Unit) => t.mode !== "refresh" && this.settle(t.root, u, { sig: unitSig(u), state: "failed" });
+    const fail = (u: Unit, until = this.now() + RETRY_MS) => t.mode !== "refresh" && this.settle(t.root, u, { sig: unitSig(u), state: "failed", until });
     const doneWith = (u: Unit, verdict: CloudVerdict) => this.settle(t.root, u, { sig: unitSig(u), state: "done", verdict });
 
     let items: Item[] = [];
     for (const { unit, flagged } of t.units) {
       const src = await this.deps.read(t.root, unit).catch(() => undefined);
-      if (!src || src.code.length < MIN_FUNCTION_CHARS || src.code.length > MAX_FUNCTION_CHARS || !this.deps.enabled()) {
+      if (!src || src.code.length < MIN_FUNCTION_CHARS || src.code.length > MAX_FUNCTION_CHARS) {
+        fail(unit, Infinity);
+        continue;
+      }
+      if (!this.deps.enabled()) {
         fail(unit);
         continue;
       }

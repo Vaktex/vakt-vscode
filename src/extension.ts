@@ -4,7 +4,7 @@ import { CloudAuth } from "./auth";
 import { GraphHost } from "./graph/vscodeHost";
 import { LiveScorer, modelCached, resolveBinary, runPatrol, runResults, ScanError, ScanSettings, serveArgs } from "./cli";
 import { randomUUID } from "node:crypto";
-import { Capped, CloudClient, cloudLanguage, CloudReview, CloudVerdict, MAX_FUNCTION_CHARS, VerdictCache } from "./cloud";
+import { Capped, CloudClient, cloudLanguage, CloudReview, CloudVerdict, MAX_FUNCTION_CHARS, RETRY_MS, VerdictCache } from "./cloud";
 import { agentTarget, hasGrammar, reviewPrompt } from "./present";
 import { sanitize, Unit } from "./report";
 import { Job, Scheduler } from "./scheduler";
@@ -133,7 +133,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
   };
   // Verdicts already shown are re-checked by hash now and then: a better model or the crowd may know more.
   const REFRESH_MS = 6 * 3_600_000;
-  const refreshTimers = [setTimeout(() => review.refresh(store.candidates(readConfig())), 60_000), setInterval(() => review.refresh(store.candidates(readConfig())), REFRESH_MS)];
+  const refreshTimers = [
+    setTimeout(() => review.refresh(store.candidates(readConfig())), 60_000),
+    setInterval(() => review.refresh(store.candidates(readConfig())), REFRESH_MS),
+    // Findings the cloud could not answer for stay held back: ask again once it is reachable.
+    setInterval(() => review.validate(store.candidates(readConfig())), RETRY_MS),
+  ];
   ctx.subscriptions.push(
     store.onDidChange(render),
     // After render: anything new it held back is queued for review here.
@@ -280,13 +285,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
     selected: () => panel.selection,
   });
   const updateStatus = () => {
-    const n = store.findings(readConfig()).length;
+    const cfg = readConfig();
+    const n = store.findings(cfg).length;
+    const held = review.held(store.candidates(cfg));
     // A scan shows its own progress item ("VAKT: scanning …"); this one spins only for cloud review.
     status.text = !scheduler.busy && review.pending > 0 ? "$(vakt-logo) $(sync~spin)" : `$(vakt-logo) ${n}`;
     if (lastError) status.text += " $(warning)";
+    const waiting = held
+      ? ` ${held} more waiting for cloud review${cloud.available ? "" : " (cloud unreachable, retrying)"}.`
+      : "";
     status.tooltip = lastError
       ? `VAKT: ${lastError}`
-      : `${n} finding${n === 1 ? "" : "s"} at the current thresholds. Click to open.`;
+      : `${n} finding${n === 1 ? "" : "s"} at the current thresholds.${waiting} Click to open.`;
     status.show();
   };
   ctx.subscriptions.push(
