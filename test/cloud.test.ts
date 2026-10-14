@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { canonicalCode, CloudClient, CloudError, CloudReview, cloudLanguage, codeMd5, IMPORTANT_PER_HOUR, parseVerdict, ReviewDeps, VerdictCache } from "../src/cloud";
-import { MAX_CAP_PAUSE_MS, MAX_FUNCTION_CHARS } from "../src/cloud";
+import { MAX_CAP_PAUSE_MS, MAX_FUNCTION_CHARS, PACE_PER_MINUTE } from "../src/cloud";
 import { detailHtml } from "../src/detailHtml";
 import { importance, IMPORTANT } from "../src/heuristics";
 import { FAMILIES } from "../src/families";
@@ -61,7 +61,11 @@ function fakeFetch(answer: (body: { functions?: { id: string }[] }) => Answer) {
 function setup(answer: (body: { functions?: { id: string }[] }) => Answer, enabled = true) {
   const f = fakeFetch(answer);
   let now = 1_000_000;
-  const client = new CloudClient({ version: "0.1.0", base: "http://cloud", fetch: f.fn, now: () => now });
+  const slept: number[] = [];
+  const client = new CloudClient({ version: "0.1.0", base: "http://cloud", fetch: f.fn, now: () => now, sleep: async (ms) => {
+    slept.push(ms);
+    now += ms;
+  } });
   let changes = 0;
   let done!: () => void;
   const settled = new Promise<void>((r) => (done = r));
@@ -77,7 +81,7 @@ function setup(answer: (body: { functions?: { id: string }[] }) => Answer, enabl
   const review = new CloudReview({ ...deps, now: () => now });
   const store = new ResultStore();
   store.view = (root, u, g) => review.view(root, u, g);
-  return { review, store, client, sent: f.sent, settled, changes: () => changes, advance: (ms: number) => (now += ms) };
+  return { review, store, client, sent: f.sent, slept, settled, changes: () => changes, advance: (ms: number) => (now += ms) };
 }
 
 const verdict = (operation: string, families: string[] = []) => (b: { functions?: { id: string }[] }) => ({
@@ -153,6 +157,43 @@ test("cloud: one rescan reject disputes a confirmed finding; a second removes it
   assert.equal(t.store.findings(G).length, 1, "refresh: kept");
   await t.review.rescan("/r", t.store.units("/r", "src/app.py"), G);
   assert.equal(t.store.findings(G).length, 0, "second reject: removed");
+});
+
+test("cloud: requests are paced under the server's burst limit", async () => {
+  const t = setup(() => ({ body: { results: [] } }));
+  for (let i = 0; i < PACE_PER_MINUTE + 1; i++) await t.client.lookup({ items: [] });
+  assert.equal(t.sent.length, PACE_PER_MINUTE + 1);
+  assert.deepEqual(t.slept, [60_000], "the request over the limit waits for the minute to pass");
+});
+
+test("cloud: the sweep looks a whole folder up in one request, not one per file", async () => {
+  const t = setup(() => ({ body: { results: [] } }));
+  t.review["deps"].importance = () => ({ score: IMPORTANT, reasons: ["test"] });
+  const passed = (file: string) => unit({ file, severity: 0.2, top_family_prob: 0.3, flagged: false });
+  const units = ["a.py", "b.py", "c.py", "d.py"].map((f) => ({ root: "/r", unit: passed(`src/${f}`) }));
+  t.review.sweep(units, G);
+  while (t.sent.filter((r) => r.url.endsWith("/lookup")).length === 0 || t.review["draining"]) await new Promise((r) => setTimeout(r, 1));
+  const lookups = t.sent.filter((r) => r.url.endsWith("/lookup"));
+  assert.equal(lookups.length, 1);
+  assert.equal(JSON.parse(lookups[0].body).items.length, 4);
+});
+
+test("cloud: a rescan waits out a short pause and retries a refused batch", async () => {
+  let refuse = 1;
+  const t = setup((b) => (refuse-- > 0 ? { status: 429, body: { error: "Too many requests." }, headers: { "retry-after": "60" } } : verdict("confirm", ["data_neutralization"])(b)));
+  t.store.setFile("/r", "src/app.py", [unit()]);
+  await t.review.rescan("/r", t.store.units("/r", "src/app.py"), G);
+  assert.equal(t.sent.length, 2, "refused once, then sent again");
+  assert.ok(t.slept.includes(60_000), "waited out the pause");
+  assert.equal(t.store.findings(G)[0].unit.cloud?.operation, "confirm");
+});
+
+test("cloud: a rescan does not wait out a long pause", async () => {
+  const t = setup(() => ({ status: 503, body: {}, headers: { "retry-after": "3600" } }));
+  t.store.setFile("/r", "src/app.py", [unit()]);
+  await t.review.rescan("/r", t.store.units("/r", "src/app.py"), G);
+  assert.equal(t.sent.length, 1);
+  assert.deepEqual(t.slept, []);
 });
 
 test("cloud: an outage holds findings back, pauses further calls, and asks again later", async () => {

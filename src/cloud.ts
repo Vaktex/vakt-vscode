@@ -27,8 +27,12 @@ export const CLOUD_URL = (process.env.VAKT_CLOUD_URL || "https://vaktex.com").re
 export const MAX_FUNCTION_CHARS = 8_000;
 export const MIN_FUNCTION_CHARS = 16;
 export const BATCH = 8;
+/** Hashes per lookup request (the server's MAX_LOOKUPS). */
+export const LOOKUP_BATCH = 100;
 /** A rescan reviews at most this many functions of a file, highest scores first. */
 export const RESCAN_MAX = 40;
+/** A rescan waits out a pause this short (a burst limit) rather than failing; not an outage's. */
+export const RESCAN_WAIT_MS = 2 * 60_000;
 const REQUEST_TIMEOUT_MS = 60_000;
 const ACCOUNT_TIMEOUT_MS = 10_000;
 /** A 402 pauses until the cap resets (the 1st of next month UTC), never longer than this. */
@@ -104,6 +108,15 @@ export class CloudError extends Error {
 /** A pause longer than this is a limit, not an outage: local results show meanwhile. */
 export const LONG_PAUSE_MS = 3_600_000;
 
+/**
+ * Requests per minute this client sends at most. The server's burst limit is 30
+ * per IP per minute (marketing_site wrangler.jsonc VAKT_CLOUD_LIMITER), and every
+ * request over it is a strike against the IP: stay well under, with room for
+ * another window or machine behind the same IP.
+ */
+export const PACE_PER_MINUTE = 20;
+const PACE_WINDOW_MS = 60_000;
+
 function backoffMs(status: number, retryAfter: string | null): number {
   const after = Number(retryAfter);
   const told = Number.isFinite(after) && after > 0 ? Math.min(after, 86_400) * 1000 : 0;
@@ -123,6 +136,9 @@ export class CloudClient {
   private blockedUntil = 0;
   private readonly fetch: typeof fetch;
   private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  /** When each request of the last minute went out, oldest first. */
+  private readonly sentAt: number[] = [];
 
   constructor(
     private readonly opts: {
@@ -130,6 +146,7 @@ export class CloudClient {
       base?: string;
       fetch?: typeof fetch;
       now?: () => number;
+      sleep?: (ms: number) => Promise<void>;
       log?: (m: string) => void;
       /** The vaktex.com sign-in token (src/auth.ts), sent as `Authorization: Bearer`. Never logged. */
       token?: () => Promise<string | undefined>;
@@ -147,6 +164,29 @@ export class CloudClient {
   ) {
     this.fetch = opts.fetch ?? fetch;
     this.now = opts.now ?? Date.now;
+    this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  }
+
+  /** Wait until the current pause ends, if it ends within `maxMs`. False (at once) otherwise. */
+  async waitAvailable(maxMs: number): Promise<boolean> {
+    while (!this.available) {
+      if (this.blockedUntil - this.now() > maxMs) return false;
+      await this.sleep(this.blockedUntil - this.now());
+    }
+    return true;
+  }
+
+  /** Wait for a slot under PACE_PER_MINUTE, and take it. */
+  private async pace(): Promise<void> {
+    for (;;) {
+      const now = this.now();
+      while (this.sentAt.length && this.sentAt[0] <= now - PACE_WINDOW_MS) this.sentAt.shift();
+      if (this.sentAt.length < PACE_PER_MINUTE) {
+        this.sentAt.push(now);
+        return;
+      }
+      await this.sleep(this.sentAt[0] + PACE_WINDOW_MS - now);
+    }
   }
 
   /** False while backing off after a refusal or an outage. */
@@ -220,6 +260,7 @@ export class CloudClient {
 
   private async post<T>(path: string, body: unknown, control?: GraphControl): Promise<T> {
     if (!this.available) throw new CloudError(429, "cloud review is paused after an earlier refusal");
+    await this.pace();
     let res: Response;
     const token = await this.opts.token?.().catch(() => undefined);
     // Recheck after asynchronous token retrieval, immediately before the actual network call.
@@ -552,7 +593,8 @@ export class CloudReview {
       this.screened.add(key);
       return true;
     });
-    for (const t of this.byFile("important", fresh, () => false)) this.enqueue(t, false);
+    // One task per folder, not per file: its lookups go LOOKUP_BATCH hashes to a request.
+    for (const t of this.byFile("important", fresh, () => false, true)) this.enqueue(t, false);
   }
 
   /** Ask again, by hash, about verdicts already given: picks up a better model or the crowd's ignores. */
@@ -619,10 +661,11 @@ export class CloudReview {
     else for (const k of [...this.entries.keys()]) if ((JSON.parse(k) as string[])[0] === root) this.entries.delete(k);
   }
 
-  private byFile(mode: Mode, units: readonly { root: string; unit: Unit }[], flagged: (u: Unit) => boolean): Task[] {
+  /** One task per file, or per folder with `wholeRoot`. */
+  private byFile(mode: Mode, units: readonly { root: string; unit: Unit }[], flagged: (u: Unit) => boolean, wholeRoot = false): Task[] {
     const tasks = new Map<string, Task>();
     for (const { root, unit } of units) {
-      const k = JSON.stringify([root, unit.file]);
+      const k = JSON.stringify(wholeRoot ? [root] : [root, unit.file]);
       let t = tasks.get(k);
       if (!t) tasks.set(k, (t = { mode, root, units: [] }));
       t.units.push({ unit, flagged: flagged(unit) });
@@ -677,6 +720,36 @@ export class CloudReview {
     return true;
   }
 
+  /** Ask the cloud, by hash, about up to LOOKUP_BATCH items; settles what it knows and returns the rest for the model. */
+  private async lookup(t: Task, items: Item[], doneWith: (u: Unit, v: CloudVerdict) => void): Promise<Item[]> {
+    try {
+      const res = await this.deps.client.lookup({
+        items: items.map((it) => ({ md5: it.md5, local: { flagged: it.flagged, severity: it.unit.severity, top_family: it.unit.top_family } })),
+      });
+      const engine = typeof res.engine === "string" ? res.engine : "cloud";
+      const rest: Item[] = [];
+      for (const it of items) {
+        const r = res.results?.find((x) => x.md5 === it.md5);
+        const v = r && parseVerdict(r, engine);
+        // Known and current: done. Stale or disputed: show the old answer while it is re-reviewed.
+        if (v) {
+          doneWith(it.unit, v);
+          this.deps.cache?.set(it.hash, v);
+        }
+        if (!(r?.advice === "apply" && v)) rest.push(it);
+      }
+      return rest;
+    } catch (e) {
+      this.deps.log?.(`cloud lookup: ${(e as Error).message}`);
+      // Lookup unavailable: what this machine remembers, then the model.
+      return items.filter((it) => {
+        const cached = t.mode === "validate" ? this.deps.cache?.get(it.hash) : undefined;
+        if (cached) doneWith(it.unit, cached);
+        return !cached;
+      });
+    }
+  }
+
   private async run(t: Task): Promise<void> {
     // A refresh never downgrades what is shown: if the cloud cannot answer, the old verdict stays.
     const prevOf = (u: Unit) => shownVerdict(this.entries.get(unitKey(t.root, u)), unitSig(u));
@@ -721,30 +794,10 @@ export class CloudReview {
     // 1. By hash: what does the cloud already know? (A rescan always asks the model.)
     let toReview = items;
     if (t.mode !== "rescan" && items.length) {
-      try {
-        const res = await this.deps.client.lookup({
-          items: items.map((it) => ({ md5: it.md5, local: { flagged: it.flagged, severity: it.unit.severity, top_family: it.unit.top_family } })),
-        });
-        const engine = typeof res.engine === "string" ? res.engine : "cloud";
-        toReview = [];
-        for (const it of items) {
-          const r = res.results?.find((x) => x.md5 === it.md5);
-          const v = r && parseVerdict(r, engine);
-          // Known and current: done. Stale or disputed: show the old answer while it is re-reviewed.
-          if (v) {
-            doneWith(it.unit, v);
-            this.deps.cache?.set(it.hash, v);
-          }
-          if (!(r?.advice === "apply" && v)) toReview.push(it);
-        }
-      } catch (e) {
-        this.deps.log?.(`cloud lookup: ${(e as Error).message}`);
-        // Lookup unavailable: what this machine remembers, then the model.
-        toReview = items.filter((it) => {
-          const cached = t.mode === "validate" ? this.deps.cache?.get(it.hash) : undefined;
-          if (cached) doneWith(it.unit, cached);
-          return !cached;
-        });
+      toReview = [];
+      for (let i = 0; i < items.length; i += LOOKUP_BATCH) {
+        const batch = items.slice(i, i + LOOKUP_BATCH);
+        toReview.push(...(await this.lookup(t, batch, doneWith)));
       }
     }
     if (t.mode === "important") {
@@ -763,34 +816,43 @@ export class CloudReview {
     for (const [language, group] of groups) {
       for (let i = 0; i < group.length; i += BATCH) {
         const chunk = group.slice(i, i + BATCH);
-        if (!this.deps.client.available || !this.deps.enabled()) {
-          chunk.forEach((it) => fail(it.unit));
-          continue;
+        // A rescan is the user waiting: it waits out a short pause, and tries a refused batch once more.
+        for (let attempt = 0; ; attempt++) {
+          const ready = t.mode === "rescan" ? await this.deps.client.waitAvailable(RESCAN_WAIT_MS) : this.deps.client.available;
+          if (!ready || !this.deps.enabled()) {
+            chunk.forEach((it) => fail(it.unit));
+            break;
+          }
+          try {
+            const res = await this.deps.client.review({
+              mode: t.mode === "refresh" ? "validate" : t.mode,
+              language,
+              local_model: this.deps.localModel?.(t.root),
+              functions: chunk.map((it, n) => ({
+                id: String(n),
+                code: it.code,
+                local: { flagged: it.flagged, severity: it.unit.severity, top_family: it.unit.top_family, families: it.unit.families },
+              })),
+            });
+            const engine = typeof res.engine === "string" ? res.engine : "cloud";
+            chunk.forEach((it, n) => {
+              const r = res.results?.find((x) => x.id === String(n));
+              const verdict = r && parseVerdict(r, engine);
+              if (verdict) {
+                this.deps.cache?.set(it.hash, verdict);
+                doneWith(it.unit, verdict);
+              } else fail(it.unit);
+            });
+            break;
+          } catch (e) {
+            this.deps.log?.(`cloud review: ${(e as Error).message}`);
+            if (t.mode === "rescan" && attempt === 0 && e instanceof CloudError && e.status === 429) continue;
+            chunk.forEach((it) => fail(it.unit));
+            break;
+          }
         }
-        try {
-          const res = await this.deps.client.review({
-            mode: t.mode === "refresh" ? "validate" : t.mode,
-            language,
-            local_model: this.deps.localModel?.(t.root),
-            functions: chunk.map((it, n) => ({
-              id: String(n),
-              code: it.code,
-              local: { flagged: it.flagged, severity: it.unit.severity, top_family: it.unit.top_family, families: it.unit.families },
-            })),
-          });
-          const engine = typeof res.engine === "string" ? res.engine : "cloud";
-          chunk.forEach((it, n) => {
-            const r = res.results?.find((x) => x.id === String(n));
-            const verdict = r && parseVerdict(r, engine);
-            if (verdict) {
-              this.deps.cache?.set(it.hash, verdict);
-              doneWith(it.unit, verdict);
-            } else fail(it.unit);
-          });
-        } catch (e) {
-          this.deps.log?.(`cloud review: ${(e as Error).message}`);
-          chunk.forEach((it) => fail(it.unit));
-        }
+        // A folder's sweep runs long: show what is in so far.
+        this.deps.changed();
       }
     }
   }
